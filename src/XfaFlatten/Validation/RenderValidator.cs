@@ -43,10 +43,12 @@ public static class RenderValidator
         }
 
         // Check page count plausibility.
+        // XFA documents may produce more pages than the AcroForm replacement page count.
+        // For example, 1 replacement page may expand to 11 XFA pages. This is expected.
+        string? pageCountNote = null;
         if (expectedPageCount > 0 && result.Pages.Count != expectedPageCount)
         {
-            // Not necessarily invalid, but worth noting (dynamic XFA may change page count).
-            // Only fail if zero pages rendered.
+            pageCountNote = $" (XFA expanded from {expectedPageCount} to {result.Pages.Count} pages)";
         }
 
         // Check for blank pages.
@@ -74,6 +76,6 @@ public static class RenderValidator
                 $"Warning: {blankIndices.Count} blank page(s) detected (pages {pageNumbers}).");
         }
 
-        return new ValidationResult(true, [], $"All {result.Pages.Count} page(s) rendered successfully.");
+        return new ValidationResult(true, [], $"All {result.Pages.Count} page(s) rendered successfully.{pageCountNote}");
     }
 }

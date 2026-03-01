@@ -91,8 +91,8 @@ public sealed class XfaDetector
         if (xfaItem is PdfReference reference)
             xfaItem = reference.Value;
 
-        // Single stream case
-        if (xfaItem is PdfDictionary dict && dict.Stream?.Value is { Length: > 0 } streamBytes)
+        // Single stream case — use UnfilteredValue to decompress (FlateDecode etc.)
+        if (xfaItem is PdfDictionary dict && dict.Stream?.UnfilteredValue is { Length: > 0 } streamBytes)
             return streamBytes;
 
         // Array of alternating [name, stream, name, stream, ...]
@@ -118,7 +118,7 @@ public sealed class XfaDetector
                 element = refItem.Value;
 
             // Skip name entries (odd-index entries in alternating name/stream pairs are the streams)
-            if (element is PdfDictionary streamDict && streamDict.Stream?.Value is { Length: > 0 } data)
+            if (element is PdfDictionary streamDict && streamDict.Stream?.UnfilteredValue is { Length: > 0 } data)
             {
                 ms.Write(data, 0, data.Length);
             }

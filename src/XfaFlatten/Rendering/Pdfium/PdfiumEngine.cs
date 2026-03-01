@@ -74,23 +74,62 @@ public sealed class PdfiumEngine : IRenderEngine
 
     private static RenderResult RenderDocument(IntPtr document, int dpi, ConsoleLogger logger)
     {
-        // Step 3: Skip FPDF_LoadXFA.
-        // The V8 engine in the NuGet PDFium build (4522) has pointer compression
-        // cage issues that cause fatal crashes. Without V8 properly initialized,
-        // calling FPDF_LoadXFA creates a half-initialized state that crashes during
-        // cleanup. For dynamic XFA with scripts, the Playwright fallback is used.
-        logger.VerboseLog("[PDFium] Skipping XFA load (V8 not available in this build).");
+        int formType = PdfiumNative.FPDF_GetFormType(document);
+        string formTypeStr = formType switch
+        {
+            PdfiumNative.FORMTYPE_NONE => "NONE",
+            PdfiumNative.FORMTYPE_ACRO_FORM => "ACRO_FORM",
+            PdfiumNative.FORMTYPE_XFA_FULL => "XFA_FULL",
+            PdfiumNative.FORMTYPE_XFA_FOREGROUND => "XFA_FOREGROUND",
+            _ => $"UNKNOWN({formType})"
+        };
+        logger.VerboseLog($"[PDFium] Form type: {formTypeStr}");
 
-        // Step 4: Initialize Form Fill Environment (version 1, no XFA).
-        logger.VerboseLog("[PDFium] Initializing Form Fill Environment...");
-        using var formFill = PdfiumFormFill.Init(document, xfaEnabled: false);
+        int pc0 = PdfiumNative.FPDF_GetPageCount(document);
+        logger.VerboseLog($"[PDFium] Page count before XFA init: {pc0}");
 
-        // Steps 5+6: Skipped (no V8/JS execution).
-        logger.VerboseLog("[PDFium] Skipping JS/Open actions.");
+        // Step 3: Initialize Form Fill Environment with XFA enabled.
+        // In modern PDFium, InitFormFillEnvironment triggers the XFA engine
+        // when xfa_disabled=0 (including layout computation).
+        logger.VerboseLog("[PDFium] Initializing Form Fill Environment (XFA enabled)...");
+        using var formFill = PdfiumFormFill.Init(document, xfaEnabled: true);
 
-        // Step 7: Render each page.
+        int pc1 = PdfiumNative.FPDF_GetPageCount(document);
+        logger.VerboseLog($"[PDFium] Page count after form fill init: {pc1}");
+
+        // Step 4: Load XFA content (compatibility call; may be a no-op in newer builds).
+        logger.VerboseLog("[PDFium] Loading XFA...");
+        int xfaResult = PdfiumNative.FPDF_LoadXFA(document);
+        logger.VerboseLog($"[PDFium] FPDF_LoadXFA returned {xfaResult}");
+
+        int pc2 = PdfiumNative.FPDF_GetPageCount(document);
+        logger.VerboseLog($"[PDFium] Page count after FPDF_LoadXFA: {pc2}");
+
+        // Step 5: Execute document-level JavaScript actions.
+        logger.VerboseLog("[PDFium] Executing document JS actions...");
+        PdfiumNative.FORM_DoDocumentJSAction(formFill.Handle);
+
+        // Step 6: Execute document open actions.
+        logger.VerboseLog("[PDFium] Executing document open actions...");
+        PdfiumNative.FORM_DoDocumentOpenAction(formFill.Handle);
+
+        int pc3 = PdfiumNative.FPDF_GetPageCount(document);
+        logger.VerboseLog($"[PDFium] Page count after JS/Open actions: {pc3}");
+
+        // Probe: Try loading the first page to trigger XFA layout, then re-check page count.
+        var probePage = PdfiumNative.FPDF_LoadPage(document, 0);
+        if (probePage != IntPtr.Zero)
+        {
+            formFill.OnAfterLoadPage(probePage);
+            int pc4 = PdfiumNative.FPDF_GetPageCount(document);
+            logger.VerboseLog($"[PDFium] Page count after loading page 0: {pc4}");
+            formFill.OnBeforeClosePage(probePage);
+            PdfiumNative.FPDF_ClosePage(probePage);
+        }
+
+        // Step 7: Render each page — use the final page count.
         int pageCount = PdfiumNative.FPDF_GetPageCount(document);
-        logger.VerboseLog($"[PDFium] Document has {pageCount} page(s).");
+        logger.VerboseLog($"[PDFium] Final page count: {pageCount}");
 
         if (pageCount <= 0)
         {
@@ -199,9 +238,9 @@ public sealed class PdfiumEngine : IRenderEngine
             // Register the resolver so .NET can find pdfium.dll in the x64/ subfolder.
             PdfiumNative.EnsureResolver();
 
-            // Use version=2 but do NOT provide V8 isolate/platform.
-            // The old NuGet build (4522) has V8 pointer compression issues,
-            // so we avoid triggering V8 JS execution later in the pipeline.
+            // Use version=2 with V8+XFA support.
+            // Setting isolate and pPlatform to IntPtr.Zero lets PDFium
+            // create its own V8 isolate and platform internally.
             var config = new PdfiumNative.FPDF_LIBRARY_CONFIG
             {
                 version = 2,

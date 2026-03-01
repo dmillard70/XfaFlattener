@@ -218,6 +218,18 @@ rootCommand.SetHandler(async (InvocationContext context) =>
     else
         logger.VerboseLog($"Validation: {validation.Message}");
 
+    // Filter out blank pages from the render result.
+    if (validation.BlankPageIndices.Length > 0 && renderResult.Pages is not null)
+    {
+        var blankSet = new HashSet<int>(validation.BlankPageIndices);
+        var filtered = renderResult.Pages
+            .Where((_, i) => !blankSet.Contains(i))
+            .ToList();
+
+        logger.Info($"Removed {validation.BlankPageIndices.Length} blank page(s), keeping {filtered.Count} page(s).");
+        renderResult.Pages = filtered;
+    }
+
     // ========================================
     // Phase 4: PDF Assembly
     // ========================================

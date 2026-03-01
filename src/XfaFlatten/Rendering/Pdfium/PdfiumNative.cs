@@ -150,6 +150,52 @@ internal static partial class PdfiumNative
         public IntPtr FFI_PostRequestURL;
         /// <summary>FFI_PutRequestURL callback.</summary>
         public IntPtr FFI_PutRequestURL;
+
+        /// <summary>FFI_OnFocusChange callback (version 2+).</summary>
+        public IntPtr FFI_OnFocusChange;
+
+        /// <summary>FFI_DoURIActionWithKeyboardModifier callback (version 2+).</summary>
+        public IntPtr FFI_DoURIActionWithKeyboardModifier;
+    }
+
+    /// <summary>
+    /// The IPDF_JSPLATFORM struct used for JavaScript platform callbacks.
+    /// Required for XFA support — the V8 engine uses this for JS execution.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IPDF_JSPLATFORM
+    {
+        /// <summary>Version number. Use 3 for modern PDFium builds.</summary>
+        public int version;
+
+        /// <summary>app_alert callback — show alert dialog.</summary>
+        public IntPtr app_alert;
+        /// <summary>app_beep callback — play a sound.</summary>
+        public IntPtr app_beep;
+        /// <summary>app_response callback — show input dialog.</summary>
+        public IntPtr app_response;
+        /// <summary>Doc_getFilePath callback — get document file path.</summary>
+        public IntPtr Doc_getFilePath;
+        /// <summary>Doc_mail callback — mail document.</summary>
+        public IntPtr Doc_mail;
+        /// <summary>Doc_print callback — print document.</summary>
+        public IntPtr Doc_print;
+        /// <summary>Doc_submitForm callback — submit form data.</summary>
+        public IntPtr Doc_submitForm;
+        /// <summary>Doc_gotoPage callback — navigate to page.</summary>
+        public IntPtr Doc_gotoPage;
+        /// <summary>Field_browse callback — show file browser.</summary>
+        public IntPtr Field_browse;
+
+        /// <summary>Pointer to embedder data (usually FPDF_FORMFILLINFO).</summary>
+        public IntPtr m_pFormfillinfo;
+
+        // Version 2 fields (unused in v3, retained for compatibility).
+
+        /// <summary>V8 isolate pointer. Unused in v3.</summary>
+        public IntPtr m_isolate;
+        /// <summary>V8 embedder slot. Unused in v3.</summary>
+        public uint m_v8EmbedderSlot;
     }
 
     // ---------------------------------------------------------------
@@ -193,6 +239,14 @@ internal static partial class PdfiumNative
     [DllImport(PdfiumLib, CallingConvention = CallingConvention.Cdecl)]
     public static extern int FPDF_LoadXFA(IntPtr document);
 
+    [DllImport(PdfiumLib, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int FPDF_GetFormType(IntPtr document);
+
+    public const int FORMTYPE_NONE = 0;
+    public const int FORMTYPE_ACRO_FORM = 1;
+    public const int FORMTYPE_XFA_FULL = 2;
+    public const int FORMTYPE_XFA_FOREGROUND = 3;
+
     // ---------------------------------------------------------------
     // Page
     // ---------------------------------------------------------------
@@ -217,6 +271,11 @@ internal static partial class PdfiumNative
     public static extern IntPtr FPDFDOC_InitFormFillEnvironment(
         IntPtr document,
         ref FPDF_FORMFILLINFO formInfo);
+
+    [DllImport(PdfiumLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "FPDFDOC_InitFormFillEnvironment")]
+    public static extern IntPtr FPDFDOC_InitFormFillEnvironmentPtr(
+        IntPtr document,
+        IntPtr formInfo);
 
     [DllImport(PdfiumLib, CallingConvention = CallingConvention.Cdecl)]
     public static extern void FPDFDOC_ExitFormFillEnvironment(IntPtr formHandle);
@@ -300,8 +359,8 @@ internal static partial class PdfiumNative
 
     /// <summary>
     /// Registers a <see cref="NativeLibrary"/> DLL import resolver so that
-    /// the runtime can find <c>pdfium.dll</c> in the <c>x64/</c> subfolder
-    /// placed there by the NuGet package.
+    /// the runtime can find <c>pdfium.dll</c> in the NuGet package layout
+    /// (e.g. <c>runtimes/win-x64/native/</c> for bblanchon packages).
     /// </summary>
     public static void EnsureResolver()
     {
@@ -334,13 +393,22 @@ internal static partial class PdfiumNative
         if (NativeLibrary.TryLoad(libraryName, assembly, searchPath, out _resolvedHandle))
             return _resolvedHandle;
 
-        // Try the x64/ subfolder next to the assembly (NuGet package layout).
-        var assemblyDir = Path.GetDirectoryName(assembly.Location) ?? ".";
-        var candidate = Path.Combine(assemblyDir, "x64", "pdfium.dll");
+        // Use AppContext.BaseDirectory (works for single-file publish too).
+        var assemblyDir = !string.IsNullOrEmpty(assembly.Location)
+            ? Path.GetDirectoryName(assembly.Location)!
+            : AppContext.BaseDirectory;
+
+        // Try the assembly directory directly (some NuGet packages copy here).
+        var candidate = Path.Combine(assemblyDir, "pdfium.dll");
         if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out _resolvedHandle))
             return _resolvedHandle;
 
-        // Try the runtimes/win-x64/native/ subfolder (alternate NuGet layout).
+        // Try the x64/ subfolder (legacy NuGet layout).
+        candidate = Path.Combine(assemblyDir, "x64", "pdfium.dll");
+        if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out _resolvedHandle))
+            return _resolvedHandle;
+
+        // Try the runtimes/win-x64/native/ subfolder (bblanchon NuGet layout).
         candidate = Path.Combine(assemblyDir, "runtimes", "win-x64", "native", "pdfium.dll");
         if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out _resolvedHandle))
             return _resolvedHandle;

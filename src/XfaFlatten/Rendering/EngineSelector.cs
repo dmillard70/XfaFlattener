@@ -47,32 +47,23 @@ public sealed class EngineSelector
 
         if (result.Success)
         {
-            // Validate the result.
+            // Quick check: if all pages are blank, fall back to Playwright.
             var validation = RenderValidator.Validate(result, expectedPageCount);
 
-            if (validation.IsValid)
-            {
-                if (validation.BlankPageIndices.Length > 0)
-                    _logger.Warning(validation.Message);
-                else
-                    _logger.VerboseLog($"PDFium validation: {validation.Message}");
-
-                // If all pages are blank, fall back.
-                if (validation.BlankPageIndices.Length > 0 &&
-                    result.Pages != null &&
-                    validation.BlankPageIndices.Length == result.Pages.Count)
-                {
-                    _logger.Warning("All pages blank. Falling back to Playwright...");
-                }
-                else
-                {
-                    return result;
-                }
-            }
-            else
+            if (!validation.IsValid)
             {
                 _logger.Warning($"PDFium validation failed: {validation.Message}");
                 _logger.Info("Falling back to Playwright engine...");
+            }
+            else if (validation.BlankPageIndices.Length > 0 &&
+                     result.Pages != null &&
+                     validation.BlankPageIndices.Length == result.Pages.Count)
+            {
+                _logger.Warning("All pages blank. Falling back to Playwright...");
+            }
+            else
+            {
+                return result;
             }
         }
         else

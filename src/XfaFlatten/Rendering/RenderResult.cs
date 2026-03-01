@@ -18,7 +18,7 @@ public class RenderResult
     /// <summary>
     /// For bitmap-based rendering (PDFium): list of page bitmaps as BGRA byte arrays.
     /// </summary>
-    public List<PageBitmap>? Pages { get; init; }
+    public List<PageBitmap>? Pages { get; set; }
 
     /// <summary>
     /// For PDF-based rendering (Playwright): the resulting PDF as a byte array.
