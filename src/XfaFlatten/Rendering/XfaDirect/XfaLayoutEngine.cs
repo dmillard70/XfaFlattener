@@ -157,13 +157,12 @@ public sealed class XfaLayoutEngine
             if (matchedTemplate is not null)
             {
                 matchCount++;
-                // Determine data context based on template binding:
-                // - bind match="none": template doesn't create a data scope,
-                //   so children resolve fields against the PARENT (dataScope)
-                // - Otherwise: template binds by name/ref to the data child
-                XfaDataNode? instanceData = matchedTemplate.BindMatch == "none"
-                    ? dataScope   // parent scope (e.g., block node)
-                    : dataChild;  // the matched data child itself
+                // Always pass the specific data child as context.
+                // For bind match="none" templates in a choice set, the data child
+                // is still the relevant context — fields inside use bind ref to
+                // reference the specific data element (e.g., h2[*] matches THIS h2).
+                XfaDataNode? instanceData = dataChild;
+
                 double h = LayoutSubformSingleInstance(matchedTemplate, x, ref curY, availW, pageBottom, instanceData);
                 totalH += h;
             }
@@ -277,12 +276,6 @@ public sealed class XfaLayoutEngine
             double innerW = subformW - marginLeft - marginRight;
             double startY = curY + marginTop;
 
-            // Draw border/fill if visible
-            if (subform.Border.Visible || subform.Border.FillColor is not null)
-            {
-                // We'll add the border after we know the height
-            }
-
             double innerY = startY;
 
             switch (subform.Layout)
@@ -310,6 +303,12 @@ public sealed class XfaLayoutEngine
             }
 
             double subformH = innerY - startY + marginBottom;
+
+            // Emit subform border/fill after knowing the final height
+            // Only emit borders on subforms that are visual containers (have fill) or table/row elements.
+            // Flow containers (tb, lr-tb) without fill are structural and shouldn't render borders.
+            EmitSubformBorder(subform, subformX, startY - marginTop, subformW, subformH + marginTop);
+
             curY = startY + subformH;
             totalH += subformH + marginTop;
         }
@@ -371,6 +370,10 @@ public sealed class XfaLayoutEngine
         }
 
         double subformH = innerY - startY + marginBottom;
+
+        // Emit subform border/fill after knowing the final height
+        EmitSubformBorder(subform, subformX, startY - marginTop, subformW, subformH + marginTop);
+
         curY = startY + subformH;
         return subformH + marginTop;
     }
@@ -471,6 +474,9 @@ public sealed class XfaLayoutEngine
 
         var resolvedData = ResolveDataContext(row, dataCtx) ?? dataCtx;
 
+        // Track cell positions for border emission
+        var cellPositions = new List<(double x, double w, XfaBorder border)>();
+
         foreach (var cell in row.Children)
         {
             if (cell.Presence is "hidden" or "inactive") continue;
@@ -484,6 +490,15 @@ public sealed class XfaLayoutEngine
                 continue;
             }
 
+            // Get cell border info
+            XfaBorder cellBorder = cell switch
+            {
+                XfaFieldDef f => f.Border,
+                XfaSubformDef s => s.Border,
+                _ => new XfaBorder()
+            };
+            cellPositions.Add((curX, cellW, cellBorder));
+
             double tempY = curY;
             // In table rows, the column width overrides the field's W attribute
             // (fields often have placeholder widths from the template designer)
@@ -495,7 +510,18 @@ public sealed class XfaLayoutEngine
             colIdx++;
         }
 
-        curY += Math.Max(rowH, row.H ?? row.MinH ?? 4);
+        double finalRowH = Math.Max(rowH, row.H ?? row.MinH ?? 4);
+
+        // Emit borders for table cells using the final row height
+        foreach (var (cellX, cellW, cellBorder) in cellPositions)
+        {
+            EmitBorder(cellBorder, cellX, curY, cellW, finalRowH);
+        }
+
+        // Emit row-level border
+        EmitBorder(row.Border, x, curY, colWidths.Sum(), finalRowH);
+
+        curY += finalRowH;
     }
 
     /// <summary>
@@ -539,25 +565,33 @@ public sealed class XfaLayoutEngine
         // Skip invisible but still return height so layout flows correctly
         bool invisible = field.Presence == "invisible";
 
-        // Resolve value
+        // Resolve value and detect rich text formatting
         string text = ResolveFieldValue(field, dataCtx);
+        var (dataBold, dataItalic) = DetectRichTextFormatting(field, dataCtx);
 
         // Add spaceBefore from paragraph settings
         if (field.Para.SpaceBefore.HasValue && field.Para.SpaceBefore.Value > 0)
             curY += field.Para.SpaceBefore.Value;
 
         double fieldW = forceWidth ?? field.W ?? availW;
-        double fieldX = x + (field.X ?? 0);
-        double fieldY = field.Y.HasValue ? field.Y.Value : curY;
 
-        // If field has absolute Y position and it's on a page area (static element), use it
-        if (field.Y.HasValue && field.X.HasValue)
+        // For table cells (forceWidth set), X/Y in the template are relative to the row,
+        // not absolute page coordinates. The caller already provides correct x and curY.
+        // For flowing content (tb/lr-tb layouts), Y should always advance with curY.
+        // Only truly positioned fields (in positioned layout subforms with explicit X/Y
+        // and no forceWidth) should use template coordinates as-is.
+        double fieldX;
+        double fieldY;
+
+        if (forceWidth.HasValue)
         {
-            // Absolutely positioned field
-            fieldY = field.Y.Value;
+            // Table cell: x is already the column position, field.X is relative offset within cell
+            fieldX = x + (field.X ?? 0);
+            fieldY = curY;
         }
-        else if (!field.Y.HasValue)
+        else
         {
+            fieldX = x + (field.X ?? 0);
             fieldY = curY;
         }
 
@@ -568,7 +602,7 @@ public sealed class XfaLayoutEngine
         // Handle page overflow: if this field is taller than remaining space on the page,
         // split it across pages. This handles long rich text blocks.
         double remainingOnPage = pageBottom - fieldY;
-        if (!invisible && fieldH > remainingOnPage && remainingOnPage < fieldH * 0.3 && !field.Y.HasValue)
+        if (!invisible && fieldH > remainingOnPage && remainingOnPage < fieldH * 0.3)
         {
             // Not enough room and would waste > 70% of the field — start on next page
             AdvanceToNextPage(ref curY, ref pageBottom);
@@ -577,66 +611,147 @@ public sealed class XfaLayoutEngine
         }
 
         // If field is taller than a single page, emit it in page-sized chunks
-        if (!invisible && !string.IsNullOrEmpty(text) && fieldH > remainingOnPage && !field.Y.HasValue)
+        // For rich text fields, use per-paragraph segments with individual formatting.
+        if (!invisible && !string.IsNullOrEmpty(text) && fieldH > remainingOnPage)
         {
             double textX = fieldX + field.Margin.Left;
             double textW = fieldW - field.Margin.Left - field.Margin.Right;
+            double lineHeightMm = field.Font.SizePt * 0.3528 * 1.2;
 
-            // Split the text into page-sized segments by estimated line count
-            double lineHeightMm = field.Font.SizePt * 0.3528 * 1.35;
-            int totalLines = CountTextLines(text, field.Font, textW);
-            double actualFieldH = totalLines * lineHeightMm + field.Margin.Top + field.Margin.Bottom;
+            // Resolve rich text segments if available
+            var dataNode = ResolveFieldDataNode(field, dataCtx);
+            List<RichTextSegment>? richSegments = null;
+            if (dataNode?.RichTextHtml is not null)
+            {
+                richSegments = XfaDataParser.ParseRichTextSegments(dataNode.RichTextHtml);
+                if (richSegments.Count == 0) richSegments = null;
+            }
 
             double emittedY = fieldY;
-            int lineOffset = 0;
-            string[] allLines = text.Split('\n');
 
-            while (lineOffset < allLines.Length)
             {
-                double availH = pageBottom - emittedY - field.Margin.Top - field.Margin.Bottom;
-                int linesPerChunk = Math.Max((int)(availH / lineHeightMm), 1);
-
-                // Estimate how many source lines fit (accounting for wrapping)
-                var chunk = new System.Text.StringBuilder();
-                int sourceLinesUsed = 0;
-                int renderedLines = 0;
+                // Build a flat list of formatted lines directly from rich text segments.
+                // This avoids fragile text-matching between stripped HTML and segment text.
                 double charWidthMm = field.Font.SizePt * 0.3528 * 0.48;
                 double charsPerLine = textW / Math.Max(charWidthMm, 0.5);
 
-                for (int i = lineOffset; i < allLines.Length && renderedLines < linesPerChunk; i++)
+                // Formatted line: text + bold/italic/underline + optional font size + font family
+                var fmtLines = new List<(string Text, bool Bold, bool Italic, bool Underline, double? FontSizePt, string? FontFamily)>();
+
+                if (richSegments is not null && richSegments.Count > 0)
                 {
-                    if (chunk.Length > 0) chunk.Append('\n');
-                    chunk.Append(allLines[i]);
-                    int wrappedCount = allLines[i].Length == 0 ? 1
-                        : (int)Math.Ceiling(allLines[i].Length / Math.Max(charsPerLine, 1));
-                    renderedLines += Math.Max(wrappedCount, 1);
-                    sourceLinesUsed++;
+                    // Build lines directly from segments — each segment's lines inherit its formatting
+                    foreach (var seg in richSegments)
+                    {
+                        string segText = seg.Text.TrimEnd('\n');
+                        if (string.IsNullOrEmpty(segText))
+                        {
+                            fmtLines.Add(("", seg.Bold, seg.Italic, seg.Underline, seg.FontSizePt, seg.FontFamily));
+                            continue;
+                        }
+                        foreach (var line in segText.Split('\n'))
+                        {
+                            string trimmed = line.Trim();
+                            if (trimmed.Length > 0)
+                                fmtLines.Add((trimmed, seg.Bold, seg.Italic, seg.Underline, seg.FontSizePt, seg.FontFamily));
+                        }
+                    }
                 }
 
-                if (chunk.Length > 0)
+                // Fallback: use plain text lines with overall dataBold/dataItalic
+                if (fmtLines.Count == 0)
                 {
-                    double chunkH = renderedLines * lineHeightMm + field.Margin.Top + field.Margin.Bottom;
-                    _items.Add(new LayoutItem(
-                        PageIndex: _currentPage,
-                        X: textX, Y: emittedY + field.Margin.Top,
-                        W: textW, H: chunkH,
-                        Text: chunk.ToString(),
-                        Font: field.Font,
-                        Para: field.Para,
-                        Rotate: field.Rotate));
+                    foreach (var line in text.Split('\n'))
+                        fmtLines.Add((line, dataBold, dataItalic, false, null, null));
                 }
 
-                lineOffset += sourceLinesUsed;
-                if (lineOffset < allLines.Length)
+                int lineOffset = 0;
+                while (lineOffset < fmtLines.Count)
                 {
-                    AdvanceToNextPage(ref curY, ref pageBottom);
-                    emittedY = curY;
+                    double availH = pageBottom - emittedY - field.Margin.Top - field.Margin.Bottom;
+                    int linesPerChunk = Math.Max((int)(availH / lineHeightMm), 1);
+
+                    // Collect lines for this page chunk
+                    int sourceLinesUsed = 0;
+                    int renderedLines = 0;
+                    int chunkEnd = lineOffset;
+
+                    for (int i = lineOffset; i < fmtLines.Count && renderedLines < linesPerChunk; i++)
+                    {
+                        int wrappedCount = fmtLines[i].Text.Length == 0 ? 1
+                            : (int)Math.Ceiling(fmtLines[i].Text.Length / Math.Max(charsPerLine, 1));
+                        renderedLines += Math.Max(wrappedCount, 1);
+                        sourceLinesUsed++;
+                        chunkEnd = i + 1;
+                    }
+
+                    // Emit formatting-grouped sub-chunks within this page chunk
+                    double subY = emittedY + field.Margin.Top;
+                    int subStart = lineOffset;
+                    while (subStart < chunkEnd)
+                    {
+                        // Find run of lines with same formatting (bold, italic, underline, font size, family)
+                        bool curBold = fmtLines[subStart].Bold;
+                        bool curItalic = fmtLines[subStart].Italic;
+                        bool curUnderline = fmtLines[subStart].Underline;
+                        double? curFontSize = fmtLines[subStart].FontSizePt;
+                        string? curFontFamily = fmtLines[subStart].FontFamily;
+                        int subEnd = subStart + 1;
+                        while (subEnd < chunkEnd && fmtLines[subEnd].Bold == curBold
+                               && fmtLines[subEnd].Italic == curItalic && fmtLines[subEnd].Underline == curUnderline
+                               && fmtLines[subEnd].FontSizePt == curFontSize
+                               && fmtLines[subEnd].FontFamily == curFontFamily)
+                            subEnd++;
+
+                        // Build sub-chunk text and count rendered lines
+                        var subChunk = new System.Text.StringBuilder();
+                        int subRendered = 0;
+                        double subFontSizePt = curFontSize ?? field.Font.SizePt;
+                        double subCharWidthMm = subFontSizePt * 0.3528 * 0.48;
+                        double subCharsPerLine = textW / Math.Max(subCharWidthMm, 0.5);
+                        for (int i = subStart; i < subEnd; i++)
+                        {
+                            if (subChunk.Length > 0) subChunk.Append('\n');
+                            subChunk.Append(fmtLines[i].Text);
+                            int wc = fmtLines[i].Text.Length == 0 ? 1
+                                : (int)Math.Ceiling(fmtLines[i].Text.Length / Math.Max(subCharsPerLine, 1));
+                            subRendered += Math.Max(wc, 1);
+                        }
+
+                        if (subChunk.Length > 0)
+                        {
+                            double subLineH = subFontSizePt * 0.3528 * 1.2;
+                            double subH = subRendered * subLineH;
+                            var subFont = field.Font with
+                            {
+                                Typeface = curFontFamily ?? field.Font.Typeface,
+                                SizePt = subFontSizePt,
+                                Bold = field.Font.Bold || curBold,
+                                Italic = field.Font.Italic || curItalic,
+                                Underline = field.Font.Underline || curUnderline
+                            };
+                            _items.Add(new LayoutItem(
+                                PageIndex: _currentPage,
+                                X: textX, Y: subY, W: textW, H: subH,
+                                Text: subChunk.ToString(),
+                                Font: subFont,
+                                Para: field.Para,
+                                Rotate: field.Rotate));
+                            subY += subH;
+                        }
+                        subStart = subEnd;
+                    }
+
+                    lineOffset += sourceLinesUsed;
+                    if (lineOffset < fmtLines.Count)
+                    {
+                        AdvanceToNextPage(ref curY, ref pageBottom);
+                        emittedY = curY;
+                    }
                 }
             }
 
-            if (!field.Y.HasValue)
-                curY = emittedY + field.Margin.Top + field.Margin.Bottom +
-                    Math.Min(lineOffset, allLines.Length - lineOffset + 1) * lineHeightMm;
+            curY = emittedY + field.Margin.Top + field.Margin.Bottom;
 
             return fieldH + (field.Para.SpaceBefore ?? 0) + (field.Para.SpaceAfter ?? 0);
         }
@@ -647,6 +762,17 @@ public sealed class XfaLayoutEngine
             double textY = fieldY + field.Margin.Top;
             double textW = fieldW - field.Margin.Left - field.Margin.Right;
             double textH = fieldH - field.Margin.Top - field.Margin.Bottom;
+
+            // Compute effective font: merge template font with detected rich text formatting
+            var renderFont = field.Font;
+            if ((dataBold && !renderFont.Bold) || (dataItalic && !renderFont.Italic))
+            {
+                renderFont = renderFont with
+                {
+                    Bold = renderFont.Bold || dataBold,
+                    Italic = renderFont.Italic || dataItalic
+                };
+            }
 
             // Handle caption (static text or data-bound via setProperty)
             string? captionText = field.CaptionText;
@@ -662,7 +788,7 @@ public sealed class XfaLayoutEngine
                     PageIndex: _currentPage,
                     X: textX, Y: textY, W: captionW, H: textH,
                     Text: captionText,
-                    Font: field.CaptionFont ?? field.Font,
+                    Font: field.CaptionFont ?? renderFont,
                     Para: field.CaptionPara ?? field.Para,
                     Rotate: field.Rotate));
 
@@ -675,34 +801,84 @@ public sealed class XfaLayoutEngine
                 // Non-standard rotation - skip for now
             }
 
+            // Try per-paragraph rich text formatting (triggers on bold, italic, or font-size differences)
+            var dataNode = ResolveFieldDataNode(field, dataCtx);
+            if (dataNode?.RichTextHtml is not null)
+            {
+                var segments = XfaDataParser.ParseRichTextSegments(dataNode.RichTextHtml);
+                bool hasFormatting = segments.Count > 1
+                    || (segments.Count == 1 && (segments[0].Bold || segments[0].Italic
+                        || segments[0].FontSizePt.HasValue || segments[0].FontFamily is not null));
+                if (hasFormatting)
+                {
+                    // Emit per-segment layout items with individual formatting and font sizes
+                    double segY = textY;
+                    foreach (var seg in segments)
+                    {
+                        string segText = seg.Text.TrimEnd('\n');
+                        if (string.IsNullOrWhiteSpace(segText)) continue;
+
+                        double segFontSize = seg.FontSizePt ?? renderFont.SizePt;
+                        var segFont = renderFont with
+                        {
+                            Typeface = seg.FontFamily ?? renderFont.Typeface,
+                            SizePt = segFontSize,
+                            Bold = renderFont.Bold || seg.Bold,
+                            Italic = renderFont.Italic || seg.Italic,
+                            Underline = renderFont.Underline || seg.Underline
+                        };
+
+                        // Count lines for this segment using the segment's font size
+                        double segLineH = segFontSize * 0.3528 * 1.2;
+                        int lineCount = 1;
+                        foreach (char c in segText)
+                            if (c == '\n') lineCount++;
+                        double charW = segFontSize * 0.3528 * 0.48;
+                        double charsPerLine = textW / Math.Max(charW, 0.5);
+                        foreach (var line in segText.Split('\n'))
+                        {
+                            if (line.Length > charsPerLine)
+                                lineCount += (int)(line.Length / charsPerLine);
+                        }
+
+                        double segH = lineCount * segLineH;
+
+                        _items.Add(new LayoutItem(
+                            PageIndex: _currentPage,
+                            X: textX, Y: segY, W: textW, H: segH,
+                            Text: segText,
+                            Font: segFont,
+                            Para: field.Para,
+                            Rotate: field.Rotate));
+
+                        segY += segH;
+                    }
+                    goto fieldDone;
+                }
+            }
+
             _items.Add(new LayoutItem(
                 PageIndex: _currentPage,
                 X: textX, Y: textY, W: textW, H: textH,
                 Text: text,
-                Font: field.Font,
+                Font: renderFont,
                 Para: field.Para,
                 Rotate: field.Rotate));
+            fieldDone:;
         }
 
-        // Emit background fill for fields with fill colors (e.g., section headers)
-        if (field.Border.FillColor is not null && !invisible)
+        // Emit border/fill for fields
+        if (!invisible)
         {
-            _items.Add(new LayoutItem(
-                PageIndex: _currentPage,
-                X: fieldX, Y: fieldY, W: fieldW, H: fieldH,
-                Text: field.Border.FillColor,
-                Font: field.Font,
-                Para: field.Para,
-                ItemType: LayoutItemType.FilledRectangle));
+            EmitBorder(field.Border, fieldX, fieldY, fieldW, fieldH);
         }
 
-        if (!field.Y.HasValue)
-        {
-            curY = fieldY + fieldH;
-            // Add spaceAfter from paragraph settings
-            if (field.Para.SpaceAfter.HasValue && field.Para.SpaceAfter.Value > 0)
-                curY += field.Para.SpaceAfter.Value;
-        }
+        // Always advance curY for flowing content (tb, lr-tb, table cell contexts).
+        // The field's template Y is treated as relative, not absolute positioning.
+        curY = fieldY + fieldH;
+        // Add spaceAfter from paragraph settings
+        if (field.Para.SpaceAfter.HasValue && field.Para.SpaceAfter.Value > 0)
+            curY += field.Para.SpaceAfter.Value;
 
         double totalH = fieldH + (field.Para.SpaceBefore ?? 0) + (field.Para.SpaceAfter ?? 0);
         return totalH;
@@ -714,12 +890,15 @@ public sealed class XfaLayoutEngine
         if (draw.Presence is "hidden" or "inactive")
             return 0;
 
-        // Add spaceBefore
-        if (draw.Para.SpaceBefore.HasValue && draw.Para.SpaceBefore.Value > 0 && !draw.Y.HasValue)
+        // Add spaceBefore for text draws (not decorative)
+        bool isDecorative = draw.IsLine || draw.IsRectangle;
+        if (!isDecorative && draw.Para.SpaceBefore.HasValue && draw.Para.SpaceBefore.Value > 0)
             curY += draw.Para.SpaceBefore.Value;
 
         double drawX = x + (draw.X ?? 0);
-        double drawY = draw.Y.HasValue ? draw.Y.Value : curY;
+        // In flowing layouts, use curY as the base position.
+        // Static page area draws are rendered separately by XfaPdfWriter.DrawStaticElements.
+        double drawY = curY;
         double drawW = draw.W ?? availW;
         double drawH = draw.H ?? draw.MinH ?? (draw.TextValue is not null
             ? EstimateTextHeight(draw.TextValue, draw.Font, drawW, draw.Margin)
@@ -727,29 +906,52 @@ public sealed class XfaLayoutEngine
 
         if (draw.IsLine)
         {
+            // Line stroke width comes from edge thickness, not draw height
+            double strokeThicknessPt = draw.Border.Thickness * (72.0 / 25.4);
             _items.Add(new LayoutItem(
                 PageIndex: _currentPage,
                 X: drawX, Y: drawY, W: drawW, H: Math.Max(drawH, 0.2),
                 Text: "",
                 Font: draw.Font,
                 Para: draw.Para,
-                ItemType: LayoutItemType.Line));
+                ItemType: LayoutItemType.Line,
+                StrokeThicknessPt: strokeThicknessPt));
+            // Lines are decorative overlays — don't advance curY
         }
         else if (draw.IsRectangle)
         {
+            double strokeThicknessPt = draw.Border.Thickness * (72.0 / 25.4);
             _items.Add(new LayoutItem(
                 PageIndex: _currentPage,
                 X: drawX, Y: drawY, W: drawW, H: drawH,
                 Text: "",
                 Font: draw.Font,
                 Para: draw.Para,
-                ItemType: LayoutItemType.Rectangle));
+                ItemType: LayoutItemType.Rectangle,
+                StrokeThicknessPt: strokeThicknessPt));
+            // Rectangles are decorative overlays — don't advance curY
         }
         else if (!string.IsNullOrEmpty(draw.TextValue))
         {
             string text = draw.IsRichText
                 ? XfaDataParser.StripHtmlToPlainText(draw.TextValue)
                 : draw.TextValue;
+
+            // Detect bold/italic from rich text HTML
+            var drawFont = draw.Font;
+            if (draw.IsRichText)
+            {
+                bool rtBold = XfaDataParser.IsHtmlBold(draw.TextValue);
+                bool rtItalic = XfaDataParser.IsHtmlItalic(draw.TextValue);
+                if ((rtBold && !drawFont.Bold) || (rtItalic && !drawFont.Italic))
+                {
+                    drawFont = drawFont with
+                    {
+                        Bold = drawFont.Bold || rtBold,
+                        Italic = drawFont.Italic || rtItalic
+                    };
+                }
+            }
 
             if (!string.IsNullOrWhiteSpace(text))
             {
@@ -760,13 +962,11 @@ public sealed class XfaLayoutEngine
                     W: drawW - draw.Margin.Left - draw.Margin.Right,
                     H: Math.Max(drawH, 4),
                     Text: text,
-                    Font: draw.Font,
+                    Font: drawFont,
                     Para: draw.Para));
             }
-        }
 
-        if (!draw.Y.HasValue)
-        {
+            // Text draws participate in the flow
             curY = drawY + drawH;
         }
 
@@ -774,6 +974,112 @@ public sealed class XfaLayoutEngine
     }
 
     // ===================== Data Resolution =====================
+
+    /// <summary>
+    /// Detects bold/italic formatting from rich text HTML data bound to a field.
+    /// </summary>
+    private (bool Bold, bool Italic) DetectRichTextFormatting(XfaFieldDef field, XfaDataNode? dataCtx)
+    {
+        // If bind match="none", no data binding - use template font only
+        if (field.BindMatch == "none")
+            return (false, false);
+
+        // Find the data node for this field
+        XfaDataNode? node = null;
+
+        // Try explicit bind ref
+        if (field.BindRef is not null)
+        {
+            string resolvedRef = NormalizeBindRef(field.BindRef);
+            node = FindDataNode(resolvedRef, dataCtx);
+        }
+
+        // Try by name
+        if (node is null && field.Name is not null && dataCtx is not null)
+        {
+            var children = dataCtx.GetChildren(field.Name);
+            if (children.Count > 0)
+                node = children[0];
+        }
+
+        // Try global lookup
+        if (node is null && field.Name is not null && _data.NodesByName.TryGetValue(field.Name, out var nodes) && nodes.Count > 0)
+            node = nodes[0];
+
+        if (node is null)
+            return (false, false);
+
+        // Check for bold/italic in rich text HTML
+        bool bold = false;
+        bool italic = false;
+
+        if (node.RichTextHtml is not null)
+        {
+            bold = XfaDataParser.IsHtmlBold(node.RichTextHtml);
+            italic = XfaDataParser.IsHtmlItalic(node.RichTextHtml);
+        }
+
+        return (bold, italic);
+    }
+
+    /// <summary>
+    /// Resolves the data node for a field, returning the node with possible RichTextHtml.
+    /// Used to get per-paragraph rich text segments.
+    /// </summary>
+    private XfaDataNode? ResolveFieldDataNode(XfaFieldDef field, XfaDataNode? dataCtx)
+    {
+        if (field.BindMatch == "none") return null;
+
+        XfaDataNode? node = null;
+
+        if (field.BindRef is not null)
+        {
+            string resolvedRef = NormalizeBindRef(field.BindRef);
+            node = FindDataNode(resolvedRef, dataCtx);
+        }
+
+        if (node is null && field.Name is not null && dataCtx is not null)
+        {
+            if (string.Equals(field.Name, dataCtx.Name, StringComparison.OrdinalIgnoreCase))
+                return dataCtx;
+
+            var children = dataCtx.GetChildren(field.Name);
+            if (children.Count > 0) node = children[0];
+        }
+
+        if (node is null && field.Name is not null && _data.NodesByName.TryGetValue(field.Name, out var nodes) && nodes.Count > 0)
+            node = nodes[0];
+
+        return node;
+    }
+
+    /// <summary>
+    /// Finds a data node by bind ref path.
+    /// </summary>
+    private XfaDataNode? FindDataNode(string bindRef, XfaDataNode? dataCtx)
+    {
+        XfaDataNode? node = null;
+
+        // Self-reference check: if bind ref matches the context node's name
+        if (dataCtx is not null)
+        {
+            string simpleName = bindRef;
+            int bracketIdx = simpleName.IndexOf('[');
+            if (bracketIdx >= 0) simpleName = simpleName[..bracketIdx];
+            int dotIdx = simpleName.LastIndexOf('.');
+            if (dotIdx >= 0) simpleName = simpleName[(dotIdx + 1)..];
+
+            if (string.Equals(simpleName, dataCtx.Name, StringComparison.OrdinalIgnoreCase))
+                return dataCtx;
+        }
+
+        if (dataCtx is not null)
+            node = dataCtx.Navigate(bindRef);
+        node ??= _data.Root.Navigate(bindRef);
+        if (node is null && _data.Root.Children.Count > 0)
+            node = _data.Root.Children[0].Navigate(bindRef);
+        return node;
+    }
 
     private string ResolveFieldValue(XfaFieldDef field, XfaDataNode? dataCtx)
     {
@@ -792,6 +1098,14 @@ public sealed class XfaLayoutEngine
         // Try matching by field name in current data context
         if (field.Name is not null && dataCtx is not null)
         {
+            // Self-reference: if the context node's name matches the field name, use it directly
+            if (string.Equals(field.Name, dataCtx.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                return dataCtx.RichTextHtml is not null
+                    ? XfaDataParser.StripHtmlToPlainText(dataCtx.RichTextHtml)
+                    : dataCtx.TextValue ?? "";
+            }
+
             var children = dataCtx.GetChildren(field.Name);
             if (children.Count > 0)
             {
@@ -844,6 +1158,27 @@ public sealed class XfaLayoutEngine
     {
         // Navigate from the data root or current context
         XfaDataNode? node = null;
+
+        // Self-reference check: if the bind ref (possibly with array index stripped)
+        // matches the data context node's own name, return the context itself.
+        // This handles choice set templates where bind match="none" on the subform
+        // and bind ref="name[*]" on the field — the data context IS the matched node.
+        if (dataCtx is not null)
+        {
+            string simpleName = bindRef;
+            int bracketIdx = simpleName.IndexOf('[');
+            if (bracketIdx >= 0) simpleName = simpleName[..bracketIdx];
+            int dotIdx = simpleName.LastIndexOf('.');
+            if (dotIdx >= 0) simpleName = simpleName[(dotIdx + 1)..];
+
+            if (string.Equals(simpleName, dataCtx.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                node = dataCtx;
+                return node.RichTextHtml is not null
+                    ? XfaDataParser.StripHtmlToPlainText(node.RichTextHtml)
+                    : node.TextValue;
+            }
+        }
 
         // Try from current context first
         if (dataCtx is not null)
@@ -1162,7 +1497,10 @@ public sealed class XfaLayoutEngine
                     {
                         double fx = field.X.Value + field.Margin.Left;
                         double fy = field.Y.Value + field.Margin.Top;
-                        double fw = (field.W ?? 30) - field.Margin.Left - field.Margin.Right;
+                        // Use content area width as fallback when field has no explicit width
+                        // (e.g., field with minW="178mm" but no w attribute)
+                        double defaultW = pageArea.ContentArea.W + pageArea.ContentArea.X - field.X.Value;
+                        double fw = (field.W ?? defaultW) - field.Margin.Left - field.Margin.Right;
                         double fh = (field.H ?? 5) - field.Margin.Top - field.Margin.Bottom;
 
                         // Handle caption
@@ -1289,20 +1627,104 @@ public sealed class XfaLayoutEngine
         }
     }
 
+    // ===================== Border Emission =====================
+
+    /// <summary>
+    /// Emits borders for subforms. Flow containers (tb, lr-tb) only render fill backgrounds
+    /// and borders with explicit edge colors. Table/row subforms and subforms with fills always render.
+    /// This prevents structural wrapper subforms from rendering unwanted border rectangles.
+    /// </summary>
+    private void EmitSubformBorder(XfaSubformDef subform, double x, double y, double w, double h)
+    {
+        if (w <= 0 || h <= 0) return;
+        var border = subform.Border;
+
+        // Always emit fill background
+        if (border.FillColor is not null)
+        {
+            _items.Add(new LayoutItem(
+                PageIndex: _currentPage,
+                X: x, Y: y, W: w, H: h,
+                Text: "",
+                Font: new XfaFont(),
+                Para: new XfaPara(),
+                ItemType: LayoutItemType.FilledRectangle,
+                FillColor: border.FillColor));
+        }
+
+        // Render stroked border if visible. Subforms without a <border> element get
+        // Visible=false by default, so structural wrappers won't render unwanted borders.
+        // Only subforms with an explicit visible <edge> in their <border> get Visible=true.
+        if (border.Visible && border.Thickness > 0)
+        {
+            double thicknessPt = border.Thickness * (72.0 / 25.4);
+            _items.Add(new LayoutItem(
+                PageIndex: _currentPage,
+                X: x, Y: y, W: w, H: h,
+                Text: "",
+                Font: new XfaFont(),
+                Para: new XfaPara(),
+                ItemType: LayoutItemType.Rectangle,
+                StrokeColor: border.StrokeColor,
+                StrokeThicknessPt: thicknessPt));
+        }
+    }
+
+    /// <summary>
+    /// Emits fill and/or stroke rectangles for a border definition.
+    /// Fill is emitted first (behind content), stroke is emitted second (on top).
+    /// </summary>
+    private void EmitBorder(XfaBorder border, double x, double y, double w, double h)
+    {
+        if (w <= 0 || h <= 0) return;
+
+        // Emit fill background
+        if (border.FillColor is not null)
+        {
+            _items.Add(new LayoutItem(
+                PageIndex: _currentPage,
+                X: x, Y: y, W: w, H: h,
+                Text: "",
+                Font: new XfaFont(),
+                Para: new XfaPara(),
+                ItemType: LayoutItemType.FilledRectangle,
+                FillColor: border.FillColor));
+        }
+
+        // Emit stroked border
+        if (border.Visible && border.Thickness > 0)
+        {
+            // Convert thickness from mm to pt for the layout item
+            double thicknessPt = border.Thickness * (72.0 / 25.4);
+            _items.Add(new LayoutItem(
+                PageIndex: _currentPage,
+                X: x, Y: y, W: w, H: h,
+                Text: "",
+                Font: new XfaFont(),
+                Para: new XfaPara(),
+                ItemType: LayoutItemType.Rectangle,
+                StrokeColor: border.StrokeColor,
+                StrokeThicknessPt: thicknessPt));
+        }
+    }
+
     // ===================== Text Measurement =====================
 
     private static double EstimateTextHeight(string text, XfaFont font, double widthMm, XfaMargin margin)
     {
-        double minLineH = font.SizePt * 0.3528 * 1.35 + margin.Top + margin.Bottom;
-        if (string.IsNullOrEmpty(text)) return Math.Max(minLineH, 3);
+        // Use a conservative line height factor (1.15) for single-line minimum.
+        // This ensures minH from the template controls field height for single-line text,
+        // since most XFA fields specify minH="4mm" which should be the effective height.
+        double singleLineH = font.SizePt * 0.3528 * 1.15 + margin.Top + margin.Bottom;
+        if (string.IsNullOrEmpty(text)) return Math.Max(singleLineH, 3);
 
         double availW = widthMm - margin.Left - margin.Right;
         if (availW <= 0) availW = widthMm;
 
-        // Average character width is roughly 0.52 * font size in points (calibrated for Arial)
+        // Average character width is roughly 0.48 * font size in points (calibrated for Arial)
         // Convert to mm: 1pt = 0.3528mm
-        double charWidthMm = font.SizePt * 0.3528 * 0.52;
-        if (font.Bold) charWidthMm *= 1.1;
+        double charWidthMm = font.SizePt * 0.3528 * 0.48;
+        if (font.Bold) charWidthMm *= 1.08;
 
         double charsPerLine = availW / Math.Max(charWidthMm, 0.5);
 
@@ -1322,11 +1744,11 @@ public sealed class XfaLayoutEngine
             }
         }
 
-        // Line height: 1.35x typical for XFA rendering
-        double lineHeightMm = font.SizePt * 0.3528 * 1.35;
+        // Multi-line: use 1.2x line height factor (calibrated against Adobe reference output)
+        double lineHeightMm = font.SizePt * 0.3528 * 1.2;
         double textH = totalLines * lineHeightMm + margin.Top + margin.Bottom;
 
-        return Math.Max(textH, minLineH);
+        return Math.Max(textH, singleLineH);
     }
 
     private static int CountTextLines(string text, XfaFont font, double widthMm)

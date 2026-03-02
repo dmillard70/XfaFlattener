@@ -4,16 +4,24 @@ using PdfSharp.Fonts;
 namespace XfaFlatten.Rendering.XfaDirect;
 
 /// <summary>
-/// Font resolver that loads fonts from the Windows system fonts directory.
+/// Font resolver that loads fonts from the Windows system fonts directory
+/// and embedded SparkasseRg fonts extracted from the reference PDF.
 /// Required by PDFSharp 6+ which doesn't have built-in system font access in .NET 6+.
 /// </summary>
 public sealed class SystemFontResolver : IFontResolver
 {
     private static readonly string FontDir = Environment.GetFolderPath(Environment.SpecialFolder.Fonts);
 
+    // Cache for embedded font data (loaded from disk on first access)
+    private static readonly Dictionary<string, byte[]?> EmbeddedFontCache = new(StringComparer.OrdinalIgnoreCase);
+    private static string? _embeddedFontDir;
+
     // Map font family + style to file name
     private static readonly Dictionary<string, string> FontMap = new(StringComparer.OrdinalIgnoreCase)
     {
+        // SparkasseRg (extracted from reference PDF, subset)
+        { "SparkasseRg|Regular", "SparkasseRg-Regular.otf" },
+        { "SparkasseRg|Bold", "SparkasseRg-Bold.otf" },
         // Arial
         { "Arial|Regular", "arial.ttf" },
         { "Arial|Bold", "arialbd.ttf" },
@@ -44,6 +52,13 @@ public sealed class SystemFontResolver : IFontResolver
         { "Calibri|Bold", "calibrib.ttf" },
         { "Calibri|Italic", "calibrii.ttf" },
         { "Calibri|BoldItalic", "calibriz.ttf" },
+    };
+
+    // Embedded font file names (not in system fonts dir)
+    private static readonly HashSet<string> EmbeddedFonts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SparkasseRg-Regular.otf",
+        "SparkasseRg-Bold.otf",
     };
 
     /// <summary>
@@ -89,12 +104,17 @@ public sealed class SystemFontResolver : IFontResolver
     {
         if (FontMap.TryGetValue(faceName, out string? fileName))
         {
+            // Check if this is an embedded font (in our fonts/ directory)
+            if (EmbeddedFonts.Contains(fileName))
+                return LoadEmbeddedFont(fileName);
+
+            // System font
             string path = Path.Combine(FontDir, fileName);
             if (File.Exists(path))
                 return File.ReadAllBytes(path);
         }
 
-        // Try direct file name
+        // Try direct file name in system fonts
         string directPath = Path.Combine(FontDir, faceName);
         if (File.Exists(directPath))
             return File.ReadAllBytes(directPath);
@@ -104,6 +124,70 @@ public sealed class SystemFontResolver : IFontResolver
         if (File.Exists(arialPath))
             return File.ReadAllBytes(arialPath);
 
+        return null;
+    }
+
+    private static byte[]? LoadEmbeddedFont(string fileName)
+    {
+        if (EmbeddedFontCache.TryGetValue(fileName, out byte[]? cached))
+            return cached;
+
+        // Find the fonts directory relative to the executable
+        string? fontsDir = FindFontsDirectory();
+        if (fontsDir is null)
+        {
+            EmbeddedFontCache[fileName] = null;
+            return null;
+        }
+
+        string path = Path.Combine(fontsDir, fileName);
+        if (File.Exists(path))
+        {
+            byte[] data = File.ReadAllBytes(path);
+            EmbeddedFontCache[fileName] = data;
+            return data;
+        }
+
+        EmbeddedFontCache[fileName] = null;
+        return null;
+    }
+
+    private static string? FindFontsDirectory()
+    {
+        if (_embeddedFontDir is not null)
+            return _embeddedFontDir;
+
+        // Search relative to the executable, then working directory
+        string[] searchBases = [
+            AppContext.BaseDirectory,
+            Environment.CurrentDirectory,
+        ];
+
+        foreach (string basePath in searchBases)
+        {
+            // Try: <base>/fonts/
+            string candidate = Path.Combine(basePath, "fonts");
+            if (Directory.Exists(candidate))
+            {
+                _embeddedFontDir = candidate;
+                return candidate;
+            }
+
+            // Try going up directories (for development: src/XfaFlatten/bin/Debug → root/fonts)
+            string? dir = basePath;
+            for (int i = 0; i < 6 && dir is not null; i++)
+            {
+                candidate = Path.Combine(dir, "fonts");
+                if (Directory.Exists(candidate))
+                {
+                    _embeddedFontDir = candidate;
+                    return candidate;
+                }
+                dir = Path.GetDirectoryName(dir);
+            }
+        }
+
+        _embeddedFontDir = "";  // Mark as searched (empty = not found)
         return null;
     }
 }

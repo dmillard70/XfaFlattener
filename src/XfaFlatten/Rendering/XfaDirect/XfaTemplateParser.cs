@@ -496,14 +496,32 @@ public sealed class XfaTemplateParser
         if (borderNode is null)
             return new XfaBorder();
 
-        var edgeNode = FindChild(borderNode, "edge");
-        bool visible = true;
+        // Check border-level presence
+        string? borderPresence = GetAttr(borderNode, "presence");
+        if (borderPresence == "hidden")
+            return new XfaBorder(Visible: false);
+
+        // Parse all edge elements (XFA borders can have 1 or 4 edges: top, right, bottom, left)
         double thickness = 0.2;
-        if (edgeNode is not null)
+        string? strokeColor = null;
+        bool anyEdgeVisible = false;
+
+        foreach (XmlNode child in borderNode.ChildNodes)
         {
-            string? presence = GetAttr(edgeNode, "presence");
-            if (presence == "hidden") visible = false;
-            thickness = ParseMeasurement(GetAttr(edgeNode, "thickness")) ?? 0.2;
+            if (child.LocalName != "edge") continue;
+
+            string? edgePresence = GetAttr(child, "presence");
+            if (edgePresence == "hidden") continue;
+
+            anyEdgeVisible = true;
+            double edgeThickness = ParseMeasurement(GetAttr(child, "thickness")) ?? 0.2;
+            if (edgeThickness > thickness || strokeColor is null)
+                thickness = edgeThickness;
+
+            // Parse edge color
+            var edgeColorNode = FindChild(child, "color");
+            if (edgeColorNode is not null)
+                strokeColor ??= GetAttr(edgeColorNode, "value");
         }
 
         string? fillColor = null;
@@ -515,7 +533,8 @@ public sealed class XfaTemplateParser
                 fillColor = GetAttr(colorNode, "value");
         }
 
-        return new XfaBorder(visible, thickness, fillColor);
+        bool isVisible = anyEdgeVisible || fillColor is not null;
+        return new XfaBorder(isVisible, thickness, fillColor, strokeColor);
     }
 
     private static string? ParseBindRef(XmlNode node)

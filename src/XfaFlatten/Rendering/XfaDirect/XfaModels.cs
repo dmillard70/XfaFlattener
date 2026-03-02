@@ -56,7 +56,7 @@ public record XfaFieldDef(
     XfaFont? CaptionFont,
     XfaPara? CaptionPara,
     double Rotate,
-    XfaBorder Border = default,
+    XfaBorder Border = default!,
     string? CaptionBindRef = null) : XfaElement(Name, X, Y, W, H, MinH, Presence);
 
 /// <summary>
@@ -152,7 +152,8 @@ public record XfaMargin(
 public record XfaBorder(
     bool Visible = false,
     double Thickness = 0.2,
-    string? FillColor = null);
+    string? FillColor = null,
+    string? StrokeColor = null);
 
 /// <summary>
 /// Corner definition for rectangles.
@@ -174,7 +175,10 @@ public record LayoutItem(
     XfaFont Font,
     XfaPara Para,
     LayoutItemType ItemType = LayoutItemType.Text,
-    double Rotate = 0);
+    double Rotate = 0,
+    string? StrokeColor = null,
+    double StrokeThicknessPt = 0,
+    string? FillColor = null);
 
 /// <summary>
 /// Types of layout items for rendering.
@@ -186,6 +190,17 @@ public enum LayoutItemType
     Rectangle,
     FilledRectangle
 }
+
+/// <summary>
+/// A segment of rich text with uniform formatting (bold/italic/underline/font size).
+/// </summary>
+/// <param name="Text">The text content of this segment.</param>
+/// <param name="Bold">Whether the text is bold.</param>
+/// <param name="Italic">Whether the text is italic.</param>
+/// <param name="Underline">Whether the text is underlined.</param>
+/// <param name="FontSizePt">Font size in points, or null to use the field's default.</param>
+/// <param name="FontFamily">Font family name from CSS, or null to use the field's default.</param>
+public record RichTextSegment(string Text, bool Bold, bool Italic, bool Underline, double? FontSizePt = null, string? FontFamily = null);
 
 // ===================== Data Models =====================
 

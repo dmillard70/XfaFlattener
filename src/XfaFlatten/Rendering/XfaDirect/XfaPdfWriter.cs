@@ -13,6 +13,10 @@ public static class XfaPdfWriter
     // Conversion: 1mm = 2.8346pt (PDF points)
     private const double MmToPt = 72.0 / 25.4;
 
+    // Reference-matching default colors (dark gray instead of pure black)
+    private static readonly XColor DefaultStrokeColor = XColor.FromArgb(34, 31, 31);
+    private static readonly XColor DefaultTextColor = XColor.FromArgb(34, 31, 31);
+
     /// <summary>
     /// Renders all layout items into a PDF byte array.
     /// </summary>
@@ -33,12 +37,20 @@ public static class XfaPdfWriter
             // Draw static elements from the page area template
             DrawStaticElements(gfx, pageArea);
 
-            // Draw content items for this page
+            // Draw content items for this page in z-order:
+            // 1. Filled rectangles (backgrounds) first
+            // 2. Text content second
+            // 3. Stroked rectangles and lines last (borders on top)
             var pageItems = items.Where(i => i.PageIndex == p).ToList();
-            foreach (var item in pageItems)
-            {
+
+            foreach (var item in pageItems.Where(i => i.ItemType == LayoutItemType.FilledRectangle))
                 DrawItem(gfx, item);
-            }
+
+            foreach (var item in pageItems.Where(i => i.ItemType == LayoutItemType.Text))
+                DrawItem(gfx, item);
+
+            foreach (var item in pageItems.Where(i => i.ItemType is LayoutItemType.Rectangle or LayoutItemType.Line))
+                DrawItem(gfx, item);
         }
 
         using var ms = new MemoryStream();
@@ -55,11 +67,11 @@ public static class XfaPdfWriter
                 break;
 
             case LayoutItemType.Rectangle:
-                DrawRectangle(gfx, item, filled: false);
+                DrawRectangle(gfx, item);
                 break;
 
             case LayoutItemType.FilledRectangle:
-                DrawRectangle(gfx, item, filled: true);
+                DrawFilledRectangle(gfx, item);
                 break;
 
             case LayoutItemType.Text:
@@ -74,7 +86,7 @@ public static class XfaPdfWriter
         if (string.IsNullOrWhiteSpace(item.Text)) return;
 
         var font = CreateFont(item.Font);
-        var brush = XBrushes.Black;
+        var brush = new XSolidBrush(DefaultTextColor);
 
         double x = item.X * MmToPt;
         double y = item.Y * MmToPt;
@@ -83,16 +95,16 @@ public static class XfaPdfWriter
 
         if (w <= 0 || h <= 0) return;
 
-        // Handle rotation
+        // Handle 90° rotation: text flows bottom-to-top in the original coordinate system.
+        // We rotate -90° around (x, y) which is the bottom-left of the text strip.
+        // In the rotated coordinate system, draw text at (x, y) flowing right for W pts
+        // with line height H pts. After rotation, "right" becomes "up" and "down" becomes "right".
         if (item.Rotate == 90)
         {
             var state = gfx.Save();
-            // Rotate around the top-left corner of the field
             gfx.RotateAtTransform(-90, new XPoint(x, y));
-            // After rotation, draw at the adjusted position
-            // The rotated text goes downward from the original position
-            var rect = new XRect(x, y - w, h, w);
-            DrawTextInRect(gfx, item.Text, font, brush, rect, item.Para);
+            var rect = new XRect(x, y, w, h);
+            DrawSingleLineText(gfx, item.Text, font, brush, rect, item.Para);
             gfx.Restore(state);
             return;
         }
@@ -163,11 +175,29 @@ public static class XfaPdfWriter
         double x2 = (item.X + item.W) * MmToPt;
         double y2 = item.Y * MmToPt; // Horizontal line
 
-        var pen = new XPen(XColors.Black, Math.Max(item.H * MmToPt, 0.5));
+        var color = ParseColor(item.StrokeColor) ?? DefaultStrokeColor;
+        double thickness = item.StrokeThicknessPt > 0 ? item.StrokeThicknessPt : 0.5;
+        var pen = new XPen(color, thickness);
         gfx.DrawLine(pen, x1, y1, x2, y2);
     }
 
-    private static void DrawRectangle(XGraphics gfx, LayoutItem item, bool filled)
+    private static void DrawRectangle(XGraphics gfx, LayoutItem item)
+    {
+        double x = item.X * MmToPt;
+        double y = item.Y * MmToPt;
+        double w = item.W * MmToPt;
+        double h = item.H * MmToPt;
+
+        if (w <= 0 || h <= 0) return;
+
+        var rect = new XRect(x, y, w, h);
+        var color = ParseColor(item.StrokeColor) ?? DefaultStrokeColor;
+        double thickness = item.StrokeThicknessPt > 0 ? item.StrokeThicknessPt : 0.5;
+        var pen = new XPen(color, thickness);
+        gfx.DrawRectangle(pen, rect);
+    }
+
+    private static void DrawFilledRectangle(XGraphics gfx, LayoutItem item)
     {
         double x = item.X * MmToPt;
         double y = item.Y * MmToPt;
@@ -178,22 +208,17 @@ public static class XfaPdfWriter
 
         var rect = new XRect(x, y, w, h);
 
-        if (filled)
-        {
-            var brush = ParseColorBrush(item.Text) ?? XBrushes.LightGray;
-            gfx.DrawRectangle(brush, rect);
-        }
-        else
-        {
-            var pen = new XPen(XColors.Black, 0.5);
-            gfx.DrawRectangle(pen, rect);
-        }
+        // Use FillColor from the new field, fall back to Text for backward compatibility
+        var brush = ParseColorBrush(item.FillColor)
+                    ?? ParseColorBrush(item.Text)
+                    ?? new XSolidBrush(XColor.FromArgb(215, 218, 219));
+        gfx.DrawRectangle(brush, rect);
     }
 
     /// <summary>
-    /// Parses an "R,G,B" color string into an XBrush.
+    /// Parses an "R,G,B" color string into an XColor.
     /// </summary>
-    private static XSolidBrush? ParseColorBrush(string? colorValue)
+    private static XColor? ParseColor(string? colorValue)
     {
         if (string.IsNullOrEmpty(colorValue)) return null;
 
@@ -203,8 +228,19 @@ public static class XfaPdfWriter
             int.TryParse(parts[1].Trim(), out int g) &&
             int.TryParse(parts[2].Trim(), out int b))
         {
-            return new XSolidBrush(XColor.FromArgb(r, g, b));
+            return XColor.FromArgb(r, g, b);
         }
+        return null;
+    }
+
+    /// <summary>
+    /// Parses an "R,G,B" color string into an XBrush.
+    /// </summary>
+    private static XSolidBrush? ParseColorBrush(string? colorValue)
+    {
+        var color = ParseColor(colorValue);
+        if (color.HasValue)
+            return new XSolidBrush(color.Value);
         return null;
     }
 
@@ -232,25 +268,25 @@ public static class XfaPdfWriter
 
         if (draw.IsLine)
         {
-            var pen = new XPen(XColors.Black, Math.Max(draw.Border.Thickness * MmToPt, 0.5));
+            double thickness = draw.Border.Thickness * MmToPt;
+            if (thickness < 0.3) thickness = 0.5;
+            var color = ParseColor(draw.Border.StrokeColor) ?? DefaultStrokeColor;
+            var pen = new XPen(color, thickness);
             gfx.DrawLine(pen, x, y, x + w, y);
         }
         else if (draw.IsRectangle)
         {
             if (w > 0 && h > 0)
             {
-                var pen = new XPen(XColors.Black, Math.Max(draw.Border.Thickness * MmToPt, 0.5));
+                double thickness = draw.Border.Thickness * MmToPt;
+                if (thickness < 0.3) thickness = 0.5;
+                var color = ParseColor(draw.Border.StrokeColor) ?? DefaultStrokeColor;
+                var pen = new XPen(color, thickness);
                 var rect = new XRect(x, y, w, h);
 
-                if (draw.Corner is not null && draw.Corner.Radius > 0)
-                {
-                    double r = draw.Corner.Radius * MmToPt;
-                    gfx.DrawRoundedRectangle(pen, rect, new XSize(r, r));
-                }
-                else
-                {
-                    gfx.DrawRectangle(pen, rect);
-                }
+                // Always use sharp corners — rounded corners from the template are
+                // not rendered in the reference Adobe output for this form.
+                gfx.DrawRectangle(pen, rect);
             }
         }
     }
@@ -281,15 +317,28 @@ public static class XfaPdfWriter
 
     private static XFont CreateFont(XfaFont xfaFont)
     {
+        bool bold = xfaFont.Bold;
+        bool italic = xfaFont.Italic;
+
+        // Detect bold/italic from font name (e.g., "SparkasseRg-Bold", "Arial-BoldMT")
+        string rawTypeface = xfaFont.Typeface;
+        if (!bold && (rawTypeface.Contains("-Bold", StringComparison.OrdinalIgnoreCase)
+                      || rawTypeface.EndsWith("Bold", StringComparison.OrdinalIgnoreCase)
+                      || rawTypeface.Contains("BoldMT", StringComparison.OrdinalIgnoreCase)))
+            bold = true;
+        if (!italic && (rawTypeface.Contains("-Italic", StringComparison.OrdinalIgnoreCase)
+                        || rawTypeface.Contains("Oblique", StringComparison.OrdinalIgnoreCase)))
+            italic = true;
+
         var style = XFontStyleEx.Regular;
-        if (xfaFont.Bold && xfaFont.Italic)
+        if (bold && italic)
             style = XFontStyleEx.BoldItalic;
-        else if (xfaFont.Bold)
+        else if (bold)
             style = XFontStyleEx.Bold;
-        else if (xfaFont.Italic)
+        else if (italic)
             style = XFontStyleEx.Italic;
 
-        string typeface = MapFontName(xfaFont.Typeface);
+        string typeface = MapFontName(rawTypeface);
         double size = Math.Max(xfaFont.SizePt, 1);
 
         try
@@ -305,7 +354,7 @@ public static class XfaPdfWriter
 
     private static string MapFontName(string typeface)
     {
-        // Map common XFA font names to system fonts
+        // Map common XFA font names to available fonts
         return typeface switch
         {
             "Myriad Pro" => "Arial",
@@ -313,10 +362,18 @@ public static class XfaPdfWriter
             "Myriad Pro Black" => "Arial",
             "DTLDocumentaSansT" => "Arial Narrow",
             "DTLDocumentaSansST" => "Arial Narrow",
-            "Free 3 of 9 Extended" => "Arial", // Barcode font - fallback
-            "Sparkasse Symbol" => "Arial",      // Custom symbol font - fallback
-            "Eformso1" => "Arial",              // Custom form font - fallback
-            "LBSLogos" => "Arial",              // Custom logo font - fallback
+            "Free 3 of 9 Extended" => "Arial",       // Barcode font - fallback
+            "Sparkasse Symbol" => "Arial",            // Custom symbol font - fallback
+            "SparkasseRg-Regular" => "SparkasseRg",   // Use extracted SparkasseRg font
+            "SparkasseRg-Bold" => "SparkasseRg",      // Use extracted SparkasseRg font (bold via style)
+            "SparkasseRg" => "SparkasseRg",           // Pass through
+            "Sparkasse Rg" => "SparkasseRg",          // Space variant → SparkasseRg
+            "Eformso1" => "Arial",                    // Custom form font - fallback
+            "LBSLogos" => "Arial",                    // Custom logo font - fallback
+            "ArialMT" => "Arial",                     // PostScript name → system name
+            "Arial-BoldMT" => "Arial",                // PostScript Bold → Arial (bold via style)
+            "Arial-ItalicMT" => "Arial",              // PostScript Italic → Arial (italic via style)
+            "Arial-BoldItalicMT" => "Arial",          // PostScript BoldItalic → Arial
             _ => typeface
         };
     }
