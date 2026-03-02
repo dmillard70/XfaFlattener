@@ -1,0 +1,1374 @@
+namespace XfaFlatten.Rendering.XfaDirect;
+
+/// <summary>
+/// Computes element positions by walking the template tree, merging data,
+/// and producing a flat list of <see cref="LayoutItem"/>s for rendering.
+/// </summary>
+public sealed class XfaLayoutEngine
+{
+    private readonly List<XfaPageArea> _pageAreas;
+    private readonly Dictionary<string, int> _pageAreaByName;
+    private readonly XfaData _data;
+    private readonly bool _verbose;
+    private readonly List<LayoutItem> _items = new();
+    private int _currentPage;
+    private int _totalPages;
+    private int _currentPageAreaIdx; // Track which page area is active
+    private readonly List<int> _pageToAreaMap = new(); // Maps page index → page area index
+
+    public XfaLayoutEngine(List<XfaPageArea> pageAreas, XfaData data, bool verbose)
+    {
+        _pageAreas = pageAreas;
+        _data = data;
+        _verbose = verbose;
+
+        // Build name→index map for page area lookup
+        _pageAreaByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < pageAreas.Count; i++)
+        {
+            _pageAreaByName[pageAreas[i].Name] = i;
+        }
+    }
+
+    /// <summary>
+    /// Layout result containing all positioned items and the total page count.
+    /// </summary>
+    /// <param name="Items">All positioned items for rendering.</param>
+    /// <param name="TotalPages">Total number of pages.</param>
+    /// <param name="PageAreaMap">Maps each page index to the page area index to use.</param>
+    public record LayoutResult(List<LayoutItem> Items, int TotalPages, List<int>? PageAreaMap = null);
+
+    /// <summary>
+    /// Performs layout of the root subform, producing positioned items.
+    /// </summary>
+    public LayoutResult Layout(XfaSubformDef rootSubform)
+    {
+        _currentPage = 0;
+        _currentPageAreaIdx = 0;
+        _pageToAreaMap.Clear();
+        _pageToAreaMap.Add(_currentPageAreaIdx); // Page 0 uses first page area
+        _items.Clear();
+
+        // Start data context from the root data node
+        var dataCtx = _data.Root;
+
+        // Get the content area for the first page
+        var ca = GetContentArea(_currentPage);
+        double curY = ca.Y;
+
+        LayoutSubform(rootSubform, ca.X, ref curY, ca.W, ca.Y + ca.H, dataCtx);
+
+        _totalPages = _currentPage + 1;
+
+        // Post-process: inject page numbers where possible
+        InjectPageNumbers();
+
+        return new LayoutResult(_items, _totalPages, new List<int>(_pageToAreaMap));
+    }
+
+    private double LayoutElement(XfaElement element, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        // Skip hidden elements
+        if (element.Presence is "hidden" or "inactive")
+            return 0;
+
+        return element switch
+        {
+            XfaSubformSetDef subformSet => LayoutSubformSet(subformSet, x, ref curY, availW, pageBottom, dataCtx),
+            XfaSubformDef subform => LayoutSubform(subform, x, ref curY, availW, pageBottom, dataCtx),
+            XfaFieldDef field => LayoutField(field, x, ref curY, availW, pageBottom, dataCtx),
+            XfaDrawDef draw => LayoutDraw(draw, x, ref curY, availW, pageBottom),
+            _ => 0
+        };
+    }
+
+    private double LayoutSubformSet(XfaSubformSetDef subformSet, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        double totalH = 0;
+
+        if (subformSet.Relation == "choice" && dataCtx is not null)
+        {
+            // Data-driven choice: iterate data children in order
+            // and instantiate the matching template subform for each.
+            totalH = LayoutChoiceSetByData(subformSet, x, ref curY, availW, pageBottom, dataCtx);
+        }
+        else
+        {
+            // Ordered: process all children in template order
+            foreach (var child in subformSet.Children)
+            {
+                double h = LayoutElement(child, x, ref curY, availW, pageBottom, dataCtx);
+                totalH += h;
+            }
+        }
+
+        return totalH;
+    }
+
+    /// <summary>
+    /// For a subformSet with relation="choice", iterate through data children
+    /// and instantiate the matching template subform for each data node.
+    /// This implements XFA data-driven subform instantiation.
+    /// </summary>
+    private double LayoutChoiceSetByData(XfaSubformSetDef subformSet, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode dataCtx)
+    {
+        double totalH = 0;
+
+        // Build a lookup of template children by the data name they match
+        var templateByDataName = BuildTemplateNameMap(subformSet.Children);
+
+        // Collect all data children that could match template subforms
+        // Navigate to the data scope (e.g., PMSDATA) where the children live
+        var dataScope = FindDataScopeForChoice(subformSet, dataCtx);
+
+        if (dataScope is null || dataScope.Children.Count == 0)
+        {
+            // No data children — fall back to template order for non-repeating items
+            foreach (var child in subformSet.Children)
+            {
+                if (child is XfaSubformDef sub)
+                {
+                    var childData = ResolveDataContext(sub, dataCtx);
+                    if (childData is not null && HasContent(childData, sub))
+                    {
+                        double h = LayoutSubform(sub, x, ref curY, availW, pageBottom, dataCtx);
+                        totalH += h;
+                    }
+                }
+            }
+            return totalH;
+        }
+
+        // Walk data children in order and instantiate matching template subforms
+        int matchCount = 0, missCount = 0;
+        foreach (var dataChild in dataScope.Children)
+        {
+            XfaSubformDef? matchedTemplate = null;
+
+            // Try to find template subform by data child name
+            if (templateByDataName.TryGetValue(dataChild.Name, out var candidates))
+            {
+                matchedTemplate = candidates;
+            }
+
+            if (matchedTemplate is not null)
+            {
+                matchCount++;
+                // Determine data context based on template binding:
+                // - bind match="none": template doesn't create a data scope,
+                //   so children resolve fields against the PARENT (dataScope)
+                // - Otherwise: template binds by name/ref to the data child
+                XfaDataNode? instanceData = matchedTemplate.BindMatch == "none"
+                    ? dataScope   // parent scope (e.g., block node)
+                    : dataChild;  // the matched data child itself
+                double h = LayoutSubformSingleInstance(matchedTemplate, x, ref curY, availW, pageBottom, instanceData);
+                totalH += h;
+            }
+            else
+            {
+                missCount++;
+                if (_verbose)
+                    Console.WriteLine($"    [Layout] Unmatched data child: '{dataChild.Name}' in {subformSet.Name}");
+            }
+        }
+
+        if (_verbose)
+            Console.WriteLine($"  [Layout] Choice set '{subformSet.Name}': {matchCount} matched, {missCount} unmatched, scope '{dataScope.Name}' ({dataScope.Children.Count} children)");
+
+        return totalH;
+    }
+
+    /// <summary>
+    /// Builds a map from data element names to their matching template subforms.
+    /// For each template child, extracts the data name it expects to bind to.
+    /// </summary>
+    private static Dictionary<string, XfaSubformDef> BuildTemplateNameMap(List<XfaElement> children)
+    {
+        var map = new Dictionary<string, XfaSubformDef>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var child in children)
+        {
+            if (child is not XfaSubformDef subform) continue;
+
+            // The data name is typically the subform name or extracted from bind ref
+            string? dataName = null;
+
+            if (subform.BindRef is not null)
+            {
+                // Extract last segment: "$record.PRINTJOB.PMSDATA.block[*]" → "block"
+                string normalized = NormalizeBindRef(subform.BindRef);
+                int dotIdx = normalized.LastIndexOf('.');
+                dataName = dotIdx >= 0 ? normalized[(dotIdx + 1)..] : normalized;
+            }
+
+            dataName ??= subform.Name;
+
+            if (dataName is not null && !map.ContainsKey(dataName))
+            {
+                map[dataName] = subform;
+            }
+        }
+
+        return map;
+    }
+
+    /// <summary>
+    /// Finds the data scope node whose children should drive the choice selection.
+    /// For bind refs like "$record.PRINTJOB.PMSDATA.block[*]", the scope is "PMSDATA".
+    /// </summary>
+    private XfaDataNode? FindDataScopeForChoice(XfaSubformSetDef subformSet, XfaDataNode dataCtx)
+    {
+        // Look at the template children's bind refs to find the parent data scope
+        foreach (var child in subformSet.Children)
+        {
+            if (child is XfaSubformDef sub && sub.BindRef is not null)
+            {
+                string normalized = NormalizeBindRef(sub.BindRef);
+                int dotIdx = normalized.LastIndexOf('.');
+                if (dotIdx >= 0)
+                {
+                    string parentPath = normalized[..dotIdx];
+                    var node = dataCtx.Navigate(parentPath);
+                    if (node is not null) return node;
+
+                    node = _data.Root.Navigate(parentPath);
+                    if (node is not null) return node;
+                }
+            }
+        }
+
+        // Fall back to current data context
+        return dataCtx;
+    }
+
+    private double LayoutSubform(XfaSubformDef subform, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        if (subform.Presence is "hidden" or "inactive" or "invisible")
+            return 0;
+
+        // Handle page break with optional target page area
+        if (subform.HasBreakBefore)
+        {
+            AdvanceToNextPage(ref curY, ref pageBottom, subform.BreakTarget, subform.BreakTargetType);
+        }
+
+        // Resolve data context for this subform
+        var resolvedData = ResolveDataContext(subform, dataCtx) ?? dataCtx;
+
+        // Get instances for repeating subforms
+        var instances = GetDataInstances(subform, dataCtx);
+
+        double totalH = 0;
+        double subformW = subform.W ?? availW;
+        double subformX = x + (subform.X ?? 0);
+
+        foreach (var instanceData in instances)
+        {
+            double marginTop = subform.Margin.Top;
+            double marginBottom = subform.Margin.Bottom;
+            double marginLeft = subform.Margin.Left;
+            double marginRight = subform.Margin.Right;
+
+            double innerX = subformX + marginLeft;
+            double innerW = subformW - marginLeft - marginRight;
+            double startY = curY + marginTop;
+
+            // Draw border/fill if visible
+            if (subform.Border.Visible || subform.Border.FillColor is not null)
+            {
+                // We'll add the border after we know the height
+            }
+
+            double innerY = startY;
+
+            switch (subform.Layout)
+            {
+                case "tb":
+                    LayoutTb(subform.Children, innerX, ref innerY, innerW, pageBottom, instanceData);
+                    break;
+
+                case "lr-tb":
+                    LayoutLrTb(subform.Children, innerX, ref innerY, innerW, pageBottom, instanceData);
+                    break;
+
+                case "table":
+                    LayoutTable(subform, innerX, ref innerY, innerW, pageBottom, instanceData);
+                    break;
+
+                case "row":
+                    LayoutRow(subform, innerX, ref innerY, innerW, pageBottom, instanceData);
+                    break;
+
+                default:
+                    // position layout or unknown - use tb as default
+                    LayoutTb(subform.Children, innerX, ref innerY, innerW, pageBottom, instanceData);
+                    break;
+            }
+
+            double subformH = innerY - startY + marginBottom;
+            curY = startY + subformH;
+            totalH += subformH + marginTop;
+        }
+
+        return totalH;
+    }
+
+    /// <summary>
+    /// Lays out a subform as a single instance with the given data context.
+    /// Used by data-driven choice sets where each data child maps to exactly one template instance.
+    /// Skips GetDataInstances (the data child IS the instance).
+    /// </summary>
+    private double LayoutSubformSingleInstance(XfaSubformDef subform, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        if (subform.Presence is "hidden" or "inactive" or "invisible")
+            return 0;
+
+        // Handle page break with optional target page area
+        if (subform.HasBreakBefore)
+        {
+            AdvanceToNextPage(ref curY, ref pageBottom, subform.BreakTarget, subform.BreakTargetType);
+        }
+
+        double subformW = subform.W ?? availW;
+        double subformX = x + (subform.X ?? 0);
+
+        double marginTop = subform.Margin.Top;
+        double marginBottom = subform.Margin.Bottom;
+        double marginLeft = subform.Margin.Left;
+        double marginRight = subform.Margin.Right;
+
+        double innerX = subformX + marginLeft;
+        double innerW = subformW - marginLeft - marginRight;
+        double startY = curY + marginTop;
+        double innerY = startY;
+
+        switch (subform.Layout)
+        {
+            case "tb":
+                LayoutTb(subform.Children, innerX, ref innerY, innerW, pageBottom, dataCtx);
+                break;
+
+            case "lr-tb":
+                LayoutLrTb(subform.Children, innerX, ref innerY, innerW, pageBottom, dataCtx);
+                break;
+
+            case "table":
+                LayoutTable(subform, innerX, ref innerY, innerW, pageBottom, dataCtx);
+                break;
+
+            case "row":
+                LayoutRow(subform, innerX, ref innerY, innerW, pageBottom, dataCtx);
+                break;
+
+            default:
+                LayoutTb(subform.Children, innerX, ref innerY, innerW, pageBottom, dataCtx);
+                break;
+        }
+
+        double subformH = innerY - startY + marginBottom;
+        curY = startY + subformH;
+        return subformH + marginTop;
+    }
+
+    private void LayoutTb(List<XfaElement> children, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        foreach (var child in children)
+        {
+            // Check if we need a new page
+            if (curY >= pageBottom - 1)
+            {
+                AdvanceToNextPage(ref curY, ref pageBottom);
+            }
+
+            LayoutElement(child, x, ref curY, availW, pageBottom, dataCtx);
+        }
+    }
+
+    private void LayoutLrTb(List<XfaElement> children, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        double curX = x;
+        double rowH = 0;
+        double rowStartY = curY;
+
+        foreach (var child in children)
+        {
+            if (child.Presence is "hidden" or "inactive")
+                continue;
+
+            double childW = child.W ?? availW;
+
+            // Wrap to next line if no room
+            if (curX + childW > x + availW + 0.5 && curX > x + 0.5)
+            {
+                curY = rowStartY + rowH;
+                curX = x;
+                rowH = 0;
+                rowStartY = curY;
+            }
+
+            // Check page overflow
+            if (curY >= pageBottom - 1)
+            {
+                AdvanceToNextPage(ref curY, ref pageBottom);
+                curX = x;
+                rowH = 0;
+                rowStartY = curY;
+            }
+
+            double tempY = curY;
+            double childH = LayoutElement(child, curX - (child.X.HasValue ? 0 : 0), ref tempY, childW, pageBottom, dataCtx);
+            if (childH <= 0) childH = child.H ?? child.MinH ?? 0;
+
+            curX += childW;
+            rowH = Math.Max(rowH, childH);
+        }
+
+        curY = rowStartY + rowH;
+    }
+
+    private void LayoutTable(XfaSubformDef table, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        // Parse column widths
+        double[] colWidths = ParseColumnWidths(table.ColumnWidths, availW);
+
+        foreach (var child in table.Children)
+        {
+            if (child is XfaSubformDef row && row.Layout == "row")
+            {
+                // Get instances for repeating rows
+                var rowInstances = GetDataInstances(row, dataCtx);
+                foreach (var rowData in rowInstances)
+                {
+                    if (curY >= pageBottom - 1)
+                    {
+                        AdvanceToNextPage(ref curY, ref pageBottom);
+                    }
+
+                    LayoutTableRow(row, x, ref curY, colWidths, pageBottom, rowData);
+                }
+            }
+            else
+            {
+                LayoutElement(child, x, ref curY, availW, pageBottom, dataCtx);
+            }
+        }
+    }
+
+    private void LayoutTableRow(XfaSubformDef row, double x, ref double curY,
+        double[] colWidths, double pageBottom, XfaDataNode? dataCtx)
+    {
+        double rowH = 0;
+        double curX = x;
+        int colIdx = 0;
+
+        var resolvedData = ResolveDataContext(row, dataCtx) ?? dataCtx;
+
+        foreach (var cell in row.Children)
+        {
+            if (cell.Presence is "hidden" or "inactive") continue;
+
+            double cellW = colIdx < colWidths.Length ? colWidths[colIdx] : (cell.W ?? 30);
+
+            // Skip zero-width columns (hidden/conditional columns)
+            if (cellW < 0.5)
+            {
+                colIdx++;
+                continue;
+            }
+
+            double tempY = curY;
+            // In table rows, the column width overrides the field's W attribute
+            // (fields often have placeholder widths from the template designer)
+            double cellH = LayoutTableCell(cell, curX, ref tempY, cellW, pageBottom, resolvedData);
+            double usedH = cellH > 0 ? cellH : (cell.H ?? cell.MinH ?? 4);
+            rowH = Math.Max(rowH, usedH);
+
+            curX += cellW;
+            colIdx++;
+        }
+
+        curY += Math.Max(rowH, row.H ?? row.MinH ?? 4);
+    }
+
+    /// <summary>
+    /// Lays out a table cell, forcing the column width to override the field's template width.
+    /// </summary>
+    private double LayoutTableCell(XfaElement cell, double x, ref double curY,
+        double columnW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        if (cell is XfaFieldDef field)
+        {
+            // Force column width by creating a modified field reference
+            return LayoutFieldWithWidth(field, x, ref curY, columnW, pageBottom, dataCtx);
+        }
+        // Non-field cells (subforms, draws) use the standard path
+        return LayoutElement(cell, x, ref curY, columnW, pageBottom, dataCtx);
+    }
+
+    private void LayoutRow(XfaSubformDef row, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        // Row layout is handled by the parent table
+        // If encountered standalone, treat as lr-tb
+        LayoutLrTb(row.Children, x, ref curY, availW, pageBottom, dataCtx);
+    }
+
+    /// <summary>
+    /// Lays out a field using a forced width (for table cells where column width overrides field W).
+    /// </summary>
+    private double LayoutFieldWithWidth(XfaFieldDef field, double x, ref double curY,
+        double forcedW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        return LayoutField(field, x, ref curY, forcedW, pageBottom, dataCtx, forceWidth: forcedW);
+    }
+
+    private double LayoutField(XfaFieldDef field, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode? dataCtx, double? forceWidth = null)
+    {
+        if (field.Presence is "hidden" or "inactive")
+            return 0;
+
+        // Skip invisible but still return height so layout flows correctly
+        bool invisible = field.Presence == "invisible";
+
+        // Resolve value
+        string text = ResolveFieldValue(field, dataCtx);
+
+        // Add spaceBefore from paragraph settings
+        if (field.Para.SpaceBefore.HasValue && field.Para.SpaceBefore.Value > 0)
+            curY += field.Para.SpaceBefore.Value;
+
+        double fieldW = forceWidth ?? field.W ?? availW;
+        double fieldX = x + (field.X ?? 0);
+        double fieldY = field.Y.HasValue ? field.Y.Value : curY;
+
+        // If field has absolute Y position and it's on a page area (static element), use it
+        if (field.Y.HasValue && field.X.HasValue)
+        {
+            // Absolutely positioned field
+            fieldY = field.Y.Value;
+        }
+        else if (!field.Y.HasValue)
+        {
+            fieldY = curY;
+        }
+
+        // Compute height: use explicit H if set, otherwise estimate from text, but never below MinH
+        double fieldH = field.H ?? EstimateTextHeight(text, field.Font, fieldW, field.Margin);
+        fieldH = Math.Max(fieldH, field.MinH ?? 0);
+
+        // Handle page overflow: if this field is taller than remaining space on the page,
+        // split it across pages. This handles long rich text blocks.
+        double remainingOnPage = pageBottom - fieldY;
+        if (!invisible && fieldH > remainingOnPage && remainingOnPage < fieldH * 0.3 && !field.Y.HasValue)
+        {
+            // Not enough room and would waste > 70% of the field — start on next page
+            AdvanceToNextPage(ref curY, ref pageBottom);
+            fieldY = curY;
+            remainingOnPage = pageBottom - fieldY;
+        }
+
+        // If field is taller than a single page, emit it in page-sized chunks
+        if (!invisible && !string.IsNullOrEmpty(text) && fieldH > remainingOnPage && !field.Y.HasValue)
+        {
+            double textX = fieldX + field.Margin.Left;
+            double textW = fieldW - field.Margin.Left - field.Margin.Right;
+
+            // Split the text into page-sized segments by estimated line count
+            double lineHeightMm = field.Font.SizePt * 0.3528 * 1.35;
+            int totalLines = CountTextLines(text, field.Font, textW);
+            double actualFieldH = totalLines * lineHeightMm + field.Margin.Top + field.Margin.Bottom;
+
+            double emittedY = fieldY;
+            int lineOffset = 0;
+            string[] allLines = text.Split('\n');
+
+            while (lineOffset < allLines.Length)
+            {
+                double availH = pageBottom - emittedY - field.Margin.Top - field.Margin.Bottom;
+                int linesPerChunk = Math.Max((int)(availH / lineHeightMm), 1);
+
+                // Estimate how many source lines fit (accounting for wrapping)
+                var chunk = new System.Text.StringBuilder();
+                int sourceLinesUsed = 0;
+                int renderedLines = 0;
+                double charWidthMm = field.Font.SizePt * 0.3528 * 0.48;
+                double charsPerLine = textW / Math.Max(charWidthMm, 0.5);
+
+                for (int i = lineOffset; i < allLines.Length && renderedLines < linesPerChunk; i++)
+                {
+                    if (chunk.Length > 0) chunk.Append('\n');
+                    chunk.Append(allLines[i]);
+                    int wrappedCount = allLines[i].Length == 0 ? 1
+                        : (int)Math.Ceiling(allLines[i].Length / Math.Max(charsPerLine, 1));
+                    renderedLines += Math.Max(wrappedCount, 1);
+                    sourceLinesUsed++;
+                }
+
+                if (chunk.Length > 0)
+                {
+                    double chunkH = renderedLines * lineHeightMm + field.Margin.Top + field.Margin.Bottom;
+                    _items.Add(new LayoutItem(
+                        PageIndex: _currentPage,
+                        X: textX, Y: emittedY + field.Margin.Top,
+                        W: textW, H: chunkH,
+                        Text: chunk.ToString(),
+                        Font: field.Font,
+                        Para: field.Para,
+                        Rotate: field.Rotate));
+                }
+
+                lineOffset += sourceLinesUsed;
+                if (lineOffset < allLines.Length)
+                {
+                    AdvanceToNextPage(ref curY, ref pageBottom);
+                    emittedY = curY;
+                }
+            }
+
+            if (!field.Y.HasValue)
+                curY = emittedY + field.Margin.Top + field.Margin.Bottom +
+                    Math.Min(lineOffset, allLines.Length - lineOffset + 1) * lineHeightMm;
+
+            return fieldH + (field.Para.SpaceBefore ?? 0) + (field.Para.SpaceAfter ?? 0);
+        }
+
+        if (!invisible && !string.IsNullOrEmpty(text))
+        {
+            double textX = fieldX + field.Margin.Left;
+            double textY = fieldY + field.Margin.Top;
+            double textW = fieldW - field.Margin.Left - field.Margin.Right;
+            double textH = fieldH - field.Margin.Top - field.Margin.Bottom;
+
+            // Handle caption (static text or data-bound via setProperty)
+            string? captionText = field.CaptionText;
+            if (captionText is null && field.CaptionBindRef is not null && dataCtx is not null)
+            {
+                // Resolve caption text from data (setProperty target="caption.value.#text" ref="bezeichner2")
+                captionText = ResolveSimpleRef(field.CaptionBindRef, dataCtx);
+            }
+            if (captionText is not null && field.CaptionReserve.HasValue)
+            {
+                double captionW = field.CaptionReserve.Value;
+                _items.Add(new LayoutItem(
+                    PageIndex: _currentPage,
+                    X: textX, Y: textY, W: captionW, H: textH,
+                    Text: captionText,
+                    Font: field.CaptionFont ?? field.Font,
+                    Para: field.CaptionPara ?? field.Para,
+                    Rotate: field.Rotate));
+
+                textX += captionW;
+                textW -= captionW;
+            }
+
+            if (field.Rotate != 0 && field.Rotate != 90)
+            {
+                // Non-standard rotation - skip for now
+            }
+
+            _items.Add(new LayoutItem(
+                PageIndex: _currentPage,
+                X: textX, Y: textY, W: textW, H: textH,
+                Text: text,
+                Font: field.Font,
+                Para: field.Para,
+                Rotate: field.Rotate));
+        }
+
+        // Emit background fill for fields with fill colors (e.g., section headers)
+        if (field.Border.FillColor is not null && !invisible)
+        {
+            _items.Add(new LayoutItem(
+                PageIndex: _currentPage,
+                X: fieldX, Y: fieldY, W: fieldW, H: fieldH,
+                Text: field.Border.FillColor,
+                Font: field.Font,
+                Para: field.Para,
+                ItemType: LayoutItemType.FilledRectangle));
+        }
+
+        if (!field.Y.HasValue)
+        {
+            curY = fieldY + fieldH;
+            // Add spaceAfter from paragraph settings
+            if (field.Para.SpaceAfter.HasValue && field.Para.SpaceAfter.Value > 0)
+                curY += field.Para.SpaceAfter.Value;
+        }
+
+        double totalH = fieldH + (field.Para.SpaceBefore ?? 0) + (field.Para.SpaceAfter ?? 0);
+        return totalH;
+    }
+
+    private double LayoutDraw(XfaDrawDef draw, double x, ref double curY,
+        double availW, double pageBottom)
+    {
+        if (draw.Presence is "hidden" or "inactive")
+            return 0;
+
+        // Add spaceBefore
+        if (draw.Para.SpaceBefore.HasValue && draw.Para.SpaceBefore.Value > 0 && !draw.Y.HasValue)
+            curY += draw.Para.SpaceBefore.Value;
+
+        double drawX = x + (draw.X ?? 0);
+        double drawY = draw.Y.HasValue ? draw.Y.Value : curY;
+        double drawW = draw.W ?? availW;
+        double drawH = draw.H ?? draw.MinH ?? (draw.TextValue is not null
+            ? EstimateTextHeight(draw.TextValue, draw.Font, drawW, draw.Margin)
+            : 0);
+
+        if (draw.IsLine)
+        {
+            _items.Add(new LayoutItem(
+                PageIndex: _currentPage,
+                X: drawX, Y: drawY, W: drawW, H: Math.Max(drawH, 0.2),
+                Text: "",
+                Font: draw.Font,
+                Para: draw.Para,
+                ItemType: LayoutItemType.Line));
+        }
+        else if (draw.IsRectangle)
+        {
+            _items.Add(new LayoutItem(
+                PageIndex: _currentPage,
+                X: drawX, Y: drawY, W: drawW, H: drawH,
+                Text: "",
+                Font: draw.Font,
+                Para: draw.Para,
+                ItemType: LayoutItemType.Rectangle));
+        }
+        else if (!string.IsNullOrEmpty(draw.TextValue))
+        {
+            string text = draw.IsRichText
+                ? XfaDataParser.StripHtmlToPlainText(draw.TextValue)
+                : draw.TextValue;
+
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                _items.Add(new LayoutItem(
+                    PageIndex: _currentPage,
+                    X: drawX + draw.Margin.Left,
+                    Y: drawY + draw.Margin.Top,
+                    W: drawW - draw.Margin.Left - draw.Margin.Right,
+                    H: Math.Max(drawH, 4),
+                    Text: text,
+                    Font: draw.Font,
+                    Para: draw.Para));
+            }
+        }
+
+        if (!draw.Y.HasValue)
+        {
+            curY = drawY + drawH;
+        }
+
+        return drawH;
+    }
+
+    // ===================== Data Resolution =====================
+
+    private string ResolveFieldValue(XfaFieldDef field, XfaDataNode? dataCtx)
+    {
+        // If bind match="none", use static value only
+        if (field.BindMatch == "none")
+            return field.StaticValue ?? "";
+
+        // Try explicit bind ref first
+        if (field.BindRef is not null)
+        {
+            string resolvedRef = NormalizeBindRef(field.BindRef);
+            string? value = ResolveBindRef(resolvedRef, dataCtx);
+            if (value is not null) return value;
+        }
+
+        // Try matching by field name in current data context
+        if (field.Name is not null && dataCtx is not null)
+        {
+            var children = dataCtx.GetChildren(field.Name);
+            if (children.Count > 0)
+            {
+                var child = children[0];
+                return child.RichTextHtml is not null
+                    ? XfaDataParser.StripHtmlToPlainText(child.RichTextHtml)
+                    : child.TextValue ?? "";
+            }
+        }
+
+        // Try global lookup by name
+        if (field.Name is not null && _data.NodesByName.TryGetValue(field.Name, out var nodes) && nodes.Count > 0)
+        {
+            var node = nodes[0];
+            return node.RichTextHtml is not null
+                ? XfaDataParser.StripHtmlToPlainText(node.RichTextHtml)
+                : node.TextValue ?? "";
+        }
+
+        return field.StaticValue ?? "";
+    }
+
+    /// <summary>
+    /// Resolves a simple field name reference against the data context.
+    /// Used for setProperty refs like "bezeichner2".
+    /// </summary>
+    private string? ResolveSimpleRef(string refName, XfaDataNode dataCtx)
+    {
+        // Try direct child lookup
+        var children = dataCtx.GetChildren(refName);
+        if (children.Count > 0)
+            return children[0].TextValue;
+
+        // Try parent scope (for bind match="none" templates, dataCtx is the parent)
+        if (dataCtx.Parent is not null)
+        {
+            children = dataCtx.Parent.GetChildren(refName);
+            if (children.Count > 0)
+                return children[0].TextValue;
+        }
+
+        // Try global
+        if (_data.NodesByName.TryGetValue(refName, out var nodes) && nodes.Count > 0)
+            return nodes[0].TextValue;
+
+        return null;
+    }
+
+    private string? ResolveBindRef(string bindRef, XfaDataNode? dataCtx)
+    {
+        // Navigate from the data root or current context
+        XfaDataNode? node = null;
+
+        // Try from current context first
+        if (dataCtx is not null)
+        {
+            node = dataCtx.Navigate(bindRef);
+        }
+
+        // Try from data root
+        node ??= _data.Root.Navigate(bindRef);
+
+        // Try from top-level data record ($record = first child of root)
+        // In XFA, $record refers to the first data element under <xfa:data>
+        if (node is null && _data.Root.Children.Count > 0)
+        {
+            node = _data.Root.Children[0].Navigate(bindRef);
+        }
+
+        if (node is null) return null;
+
+        return node.RichTextHtml is not null
+            ? XfaDataParser.StripHtmlToPlainText(node.RichTextHtml)
+            : node.TextValue;
+    }
+
+    private static string NormalizeBindRef(string bindRef)
+    {
+        // Remove XFA scope prefixes - data navigation starts from current/root data context
+        string normalized = bindRef;
+        if (normalized.StartsWith("$record.", StringComparison.OrdinalIgnoreCase))
+            normalized = normalized["$record.".Length..];
+        else if (normalized.StartsWith("$.", StringComparison.Ordinal))
+            normalized = normalized["$.".Length..];
+        else if (normalized.StartsWith("$data.", StringComparison.OrdinalIgnoreCase))
+            normalized = normalized["$data.".Length..];
+
+        // Remove array index notation for navigation
+        normalized = normalized.Replace("[*]", "").Replace("[0]", "");
+
+        return normalized;
+    }
+
+    private XfaDataNode? ResolveDataContext(XfaSubformDef subform, XfaDataNode? parentCtx)
+    {
+        if (subform.BindMatch == "none")
+            return parentCtx;
+
+        if (subform.BindRef is not null)
+        {
+            string resolvedRef = NormalizeBindRef(subform.BindRef);
+
+            // Remove array notation
+            string navRef = resolvedRef.Replace("[*]", "").Replace("[0]", "");
+
+            // Try navigation from parent context
+            if (parentCtx is not null)
+            {
+                var node = parentCtx.Navigate(navRef);
+                if (node is not null) return node;
+            }
+
+            // Try from root
+            var rootNode = _data.Root.Navigate(navRef);
+            if (rootNode is not null) return rootNode;
+
+            // Try from top-level data record ($record = first child of root)
+            if (_data.Root.Children.Count > 0)
+            {
+                var recordNode = _data.Root.Children[0].Navigate(navRef);
+                if (recordNode is not null) return recordNode;
+            }
+        }
+
+        // Match by name
+        if (subform.Name is not null && parentCtx is not null)
+        {
+            var children = parentCtx.GetChildren(subform.Name);
+            if (children.Count > 0) return children[0];
+        }
+
+        return parentCtx;
+    }
+
+    private List<XfaDataNode?> GetDataInstances(XfaSubformDef subform, XfaDataNode? parentCtx)
+    {
+        if (subform.OccurMax == 1 && subform.OccurMin >= 1)
+            return new List<XfaDataNode?> { ResolveDataContext(subform, parentCtx) };
+
+        if (subform.BindMatch == "none")
+            return new List<XfaDataNode?> { parentCtx };
+
+        // Repeating subform - find all matching data instances
+        string? dataName = null;
+        if (subform.BindRef is not null)
+        {
+            string normalized = NormalizeBindRef(subform.BindRef);
+            // Get the last segment as the repeating element name
+            int dotIdx = normalized.LastIndexOf('.');
+            dataName = dotIdx >= 0 ? normalized[(dotIdx + 1)..] : normalized;
+        }
+        dataName ??= subform.Name;
+
+        if (dataName is not null && parentCtx is not null)
+        {
+            var dataCtx = parentCtx;
+
+            // If the bind ref has a path prefix, navigate to the parent first
+            if (subform.BindRef is not null)
+            {
+                string normalized = NormalizeBindRef(subform.BindRef);
+                int dotIdx = normalized.LastIndexOf('.');
+                if (dotIdx >= 0)
+                {
+                    string parentPath = normalized[..dotIdx];
+                    var parentNode = parentCtx.Navigate(parentPath);
+                    if (parentNode is not null)
+                        dataCtx = parentNode;
+                    else
+                    {
+                        parentNode = _data.Root.Navigate(parentPath);
+                        if (parentNode is not null)
+                            dataCtx = parentNode;
+                    }
+                }
+            }
+
+            var instances = dataCtx.GetChildren(dataName);
+            if (instances.Count > 0)
+            {
+                var result = new List<XfaDataNode?>();
+                int max = subform.OccurMax < 0 ? instances.Count : Math.Min(instances.Count, subform.OccurMax);
+                for (int i = 0; i < max; i++)
+                    result.Add(instances[i]);
+                return result;
+            }
+        }
+
+        // No data instances found - check if min > 0
+        if (subform.OccurMin > 0)
+            return new List<XfaDataNode?> { parentCtx };
+
+        return new List<XfaDataNode?>();
+    }
+
+    private static bool HasContent(XfaDataNode node, XfaSubformDef subform)
+    {
+        // A node has content if it has a text value or any children
+        if (node.TextValue is not null) return true;
+        if (node.RichTextHtml is not null) return true;
+        if (node.Children.Count > 0) return true;
+
+        // Check by subform name
+        if (subform.Name is not null)
+        {
+            return node.GetChildren(subform.Name).Count > 0;
+        }
+
+        return false;
+    }
+
+    // ===================== Page Management =====================
+
+    private XfaContentArea GetContentArea(int pageIndex)
+    {
+        if (_pageAreas.Count == 0)
+            return new XfaContentArea(20, 20, 170, 257);
+
+        // Look up the page area assigned to this page
+        int areaIdx = pageIndex < _pageToAreaMap.Count
+            ? _pageToAreaMap[pageIndex]
+            : _currentPageAreaIdx;
+
+        if (areaIdx < 0 || areaIdx >= _pageAreas.Count)
+            areaIdx = Math.Min(1, _pageAreas.Count - 1);
+
+        return _pageAreas[areaIdx].ContentArea;
+    }
+
+    private void AdvanceToNextPage(ref double curY, ref double pageBottom,
+        string? breakTarget = null, string? breakTargetType = null)
+    {
+        if (_verbose) Console.WriteLine($"  [Layout] Page break: page {_currentPage}→{_currentPage+1}, curY={curY:F1}, pageBottom={pageBottom:F1}");
+        _currentPage++;
+
+        // Resolve the target page area
+        if (breakTarget is not null)
+        {
+            int targetIdx = ResolvePageAreaIndex(breakTarget, breakTargetType);
+            if (targetIdx >= 0)
+            {
+                _currentPageAreaIdx = targetIdx;
+                if (_verbose) Console.WriteLine($"  [Layout] Break to page area: {_pageAreas[targetIdx].Name} (page {_currentPage})");
+            }
+        }
+        else
+        {
+            // No explicit target: use the continuation page area
+            // Continuation = same page area set, second variant (V2)
+            // Look for a continuation page area by naming convention
+            int continuationIdx = FindContinuationPageArea(_currentPageAreaIdx);
+            if (continuationIdx >= 0)
+                _currentPageAreaIdx = continuationIdx;
+        }
+
+        // Register this page's page area
+        while (_pageToAreaMap.Count <= _currentPage)
+            _pageToAreaMap.Add(_currentPageAreaIdx);
+
+        var ca = GetContentArea(_currentPage);
+        curY = ca.Y;
+        pageBottom = ca.Y + ca.H;
+    }
+
+    /// <summary>
+    /// Resolves a break target name to a page area index.
+    /// Targets can be "PageAreaName" or "PageAreaName.ContentAreaName".
+    /// </summary>
+    private int ResolvePageAreaIndex(string target, string? targetType)
+    {
+        // Direct page area name match
+        if (_pageAreaByName.TryGetValue(target, out int idx))
+            return idx;
+
+        // Target may be "PageAreaName.ContentAreaName" — extract the page area part
+        int dotIdx = target.IndexOf('.');
+        if (dotIdx >= 0)
+        {
+            string pageAreaName = target[..dotIdx];
+            if (_pageAreaByName.TryGetValue(pageAreaName, out int idx2))
+                return idx2;
+        }
+
+        // Partial name match (target might be embedded in the actual page area name)
+        for (int i = 0; i < _pageAreas.Count; i++)
+        {
+            if (_pageAreas[i].Name.Contains(target, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Finds the continuation (V2) page area for a given page area.
+    /// Convention: DS_V1_SET0 → DS_V2_SET0 (first→continuation).
+    /// If already on V2, stay on V2.
+    /// </summary>
+    private int FindContinuationPageArea(int currentIdx)
+    {
+        if (currentIdx < 0 || currentIdx >= _pageAreas.Count)
+            return -1;
+
+        string currentName = _pageAreas[currentIdx].Name;
+
+        // Try replacing V1 with V2 in the name
+        if (currentName.Contains("_V1_", StringComparison.OrdinalIgnoreCase))
+        {
+            string continuationName = currentName.Replace("_V1_", "_V2_");
+            if (_pageAreaByName.TryGetValue(continuationName, out int idx))
+                return idx;
+        }
+
+        // If already V2 or no naming convention match, stay on current
+        return currentIdx;
+    }
+
+    private void InjectPageNumbers()
+    {
+        // Replace page number placeholders
+        foreach (var item in _items.ToList())
+        {
+            if (item.Text.Contains("xfa.layout.page") || item.Text.Contains("xfa.layout.pageCount"))
+            {
+                // These are JavaScript-computed fields we can't evaluate.
+                // We substitute with the actual page info.
+            }
+        }
+
+        // Add page number items for each page from page area static elements that have
+        // "Seite" or page count references
+        for (int p = 0; p < _totalPages; p++)
+        {
+            if (_pageAreas.Count == 0) continue;
+            int areaIdx = p < _pageToAreaMap.Count
+                ? _pageToAreaMap[p]
+                : (_pageAreas.Count > 1 ? 1 : 0);
+            if (areaIdx < 0 || areaIdx >= _pageAreas.Count)
+                areaIdx = 0;
+
+            var pageArea = _pageAreas[areaIdx];
+            foreach (var staticEl in pageArea.StaticElements)
+            {
+                if (staticEl is XfaDrawDef draw && draw.IsRichText && draw.TextValue is not null)
+                {
+                    if (draw.TextValue.Contains("floatingField") || draw.Name == "Seitenzahl" || draw.Name == "SeiteXvonY")
+                    {
+                        string pageText = $"Seite {p + 1} von {_totalPages}";
+                        _items.Add(new LayoutItem(
+                            PageIndex: p,
+                            X: (draw.X ?? 0) + draw.Margin.Left,
+                            Y: (draw.Y ?? 0) + draw.Margin.Top,
+                            W: (draw.W ?? 30) - draw.Margin.Left - draw.Margin.Right,
+                            H: (draw.H ?? 5) - draw.Margin.Top - draw.Margin.Bottom,
+                            Text: pageText,
+                            Font: draw.Font,
+                            Para: draw.Para));
+                    }
+                }
+
+                // Render positioned static fields (absolute X/Y) on each page
+                if (staticEl is XfaFieldDef field && field.Y.HasValue && field.X.HasValue
+                    && field.Presence is not "hidden" and not "inactive" and not "invisible")
+                {
+                    string text = ResolveFieldValue(field, _data.Root);
+
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        double fx = field.X.Value + field.Margin.Left;
+                        double fy = field.Y.Value + field.Margin.Top;
+                        double fw = (field.W ?? 30) - field.Margin.Left - field.Margin.Right;
+                        double fh = (field.H ?? 5) - field.Margin.Top - field.Margin.Bottom;
+
+                        // Handle caption
+                        if (field.CaptionText is not null && field.CaptionReserve.HasValue)
+                        {
+                            _items.Add(new LayoutItem(
+                                PageIndex: p,
+                                X: fx, Y: fy, W: field.CaptionReserve.Value, H: fh,
+                                Text: field.CaptionText,
+                                Font: field.CaptionFont ?? field.Font,
+                                Para: field.CaptionPara ?? field.Para,
+                                Rotate: field.Rotate));
+                            fx += field.CaptionReserve.Value;
+                            fw -= field.CaptionReserve.Value;
+                        }
+
+                        _items.Add(new LayoutItem(
+                            PageIndex: p,
+                            X: fx, Y: fy, W: fw, H: fh,
+                            Text: text,
+                            Font: field.Font,
+                            Para: field.Para,
+                            Rotate: field.Rotate));
+                    }
+                }
+
+                // Render positioned subforms from page areas (headers, footers)
+                if (staticEl is XfaSubformDef subform)
+                {
+                    RenderPageAreaSubform(subform, p);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Renders a subform from a page area's static elements onto a specific page.
+    /// Handles both absolutely positioned fields and lr-tb flowing fields.
+    /// </summary>
+    private void RenderPageAreaSubform(XfaSubformDef subform, int pageIndex)
+    {
+        // Resolve data context for this subform
+        XfaDataNode? dataCtx = subform.BindMatch == "none"
+            ? _data.Root
+            : ResolveDataContext(subform, _data.Root);
+
+        double baseX = subform.X ?? 0;
+        double baseY = subform.Y ?? 0;
+        double availW = subform.W ?? 178;
+
+        // lr-tb flow tracking for non-positioned children
+        double curX = 0;
+        double curY = 0;
+        double rowH = 0;
+
+        foreach (var child in subform.Children)
+        {
+            if (child.Presence is "hidden" or "inactive" or "invisible") continue;
+
+            double childW = child.W ?? 0;
+            double childH = child.H ?? 5;
+
+            if (child is XfaFieldDef f && f.Presence is not "hidden" and not "inactive" and not "invisible")
+            {
+                string text = ResolveFieldValue(f, dataCtx);
+                if (!string.IsNullOrEmpty(text) || f.CaptionText is not null)
+                {
+                    double fx, fy, fw, fh;
+
+                    if (f.X.HasValue && f.Y.HasValue)
+                    {
+                        // Absolutely positioned within subform
+                        fx = baseX + f.X.Value + f.Margin.Left;
+                        fy = baseY + f.Y.Value + f.Margin.Top;
+                    }
+                    else
+                    {
+                        // lr-tb flow position
+                        if (subform.Layout is "lr-tb" or "rl-tb" && curX + childW > availW && curX > 0)
+                        {
+                            curY += rowH;
+                            curX = 0;
+                            rowH = 0;
+                        }
+                        fx = baseX + curX + f.Margin.Left;
+                        fy = baseY + curY + f.Margin.Top;
+                    }
+
+                    fw = (f.W ?? childW) - f.Margin.Left - f.Margin.Right;
+                    fh = (f.H ?? childH) - f.Margin.Top - f.Margin.Bottom;
+
+                    // Handle caption
+                    if (f.CaptionText is not null && f.CaptionReserve.HasValue)
+                    {
+                        _items.Add(new LayoutItem(
+                            PageIndex: pageIndex,
+                            X: fx, Y: fy, W: f.CaptionReserve.Value, H: fh,
+                            Text: f.CaptionText,
+                            Font: f.CaptionFont ?? f.Font,
+                            Para: f.CaptionPara ?? f.Para,
+                            Rotate: f.Rotate));
+                        fx += f.CaptionReserve.Value;
+                        fw -= f.CaptionReserve.Value;
+                    }
+
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        _items.Add(new LayoutItem(
+                            PageIndex: pageIndex,
+                            X: fx, Y: fy, W: fw, H: fh,
+                            Text: text,
+                            Font: f.Font,
+                            Para: f.Para,
+                            Rotate: f.Rotate));
+                    }
+                }
+            }
+
+            if (!child.X.HasValue || !child.Y.HasValue)
+            {
+                curX += childW;
+                rowH = Math.Max(rowH, childH);
+            }
+        }
+    }
+
+    // ===================== Text Measurement =====================
+
+    private static double EstimateTextHeight(string text, XfaFont font, double widthMm, XfaMargin margin)
+    {
+        double minLineH = font.SizePt * 0.3528 * 1.35 + margin.Top + margin.Bottom;
+        if (string.IsNullOrEmpty(text)) return Math.Max(minLineH, 3);
+
+        double availW = widthMm - margin.Left - margin.Right;
+        if (availW <= 0) availW = widthMm;
+
+        // Average character width is roughly 0.52 * font size in points (calibrated for Arial)
+        // Convert to mm: 1pt = 0.3528mm
+        double charWidthMm = font.SizePt * 0.3528 * 0.52;
+        if (font.Bold) charWidthMm *= 1.1;
+
+        double charsPerLine = availW / Math.Max(charWidthMm, 0.5);
+
+        // Count lines from explicit newlines
+        var lines = text.Split('\n');
+        int totalLines = 0;
+        foreach (var line in lines)
+        {
+            if (line.Length == 0)
+            {
+                totalLines++; // empty line
+            }
+            else
+            {
+                int wrappedLines = (int)Math.Ceiling(line.Length / Math.Max(charsPerLine, 1));
+                totalLines += Math.Max(wrappedLines, 1);
+            }
+        }
+
+        // Line height: 1.35x typical for XFA rendering
+        double lineHeightMm = font.SizePt * 0.3528 * 1.35;
+        double textH = totalLines * lineHeightMm + margin.Top + margin.Bottom;
+
+        return Math.Max(textH, minLineH);
+    }
+
+    private static int CountTextLines(string text, XfaFont font, double widthMm)
+    {
+        if (string.IsNullOrEmpty(text)) return 1;
+        double charWidthMm = font.SizePt * 0.3528 * 0.52;
+        double charsPerLine = widthMm / Math.Max(charWidthMm, 0.5);
+        var lines = text.Split('\n');
+        int total = 0;
+        foreach (var line in lines)
+        {
+            int wrapped = line.Length == 0 ? 1 : (int)Math.Ceiling(line.Length / Math.Max(charsPerLine, 1));
+            total += Math.Max(wrapped, 1);
+        }
+        return total;
+    }
+
+    // ===================== Column Width Parsing =====================
+
+    private static double[] ParseColumnWidths(string? columnWidths, double totalWidth)
+    {
+        if (string.IsNullOrEmpty(columnWidths))
+            return new[] { totalWidth };
+
+        var parts = columnWidths.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var widths = new double[parts.Length];
+        for (int i = 0; i < parts.Length; i++)
+        {
+            widths[i] = XfaTemplateParser.ParseMeasurement(parts[i]) ?? (totalWidth / parts.Length);
+        }
+
+        // Scale up placeholder column widths: when the total is much less than available
+        // width, the template uses placeholder values (e.g., all 10mm) that the XFA engine
+        // would redistribute at runtime. Scale proportionally to fill available width.
+        double sum = widths.Sum();
+        if (sum > 0 && sum < totalWidth * 0.6)
+        {
+            double scale = totalWidth / sum;
+            for (int i = 0; i < widths.Length; i++)
+                widths[i] *= scale;
+        }
+
+        return widths;
+    }
+}

@@ -1,6 +1,7 @@
 using XfaFlatten.Infrastructure;
 using XfaFlatten.Rendering.Pdfium;
 using XfaFlatten.Rendering.Playwright;
+using XfaFlatten.Rendering.XfaDirect;
 using XfaFlatten.Validation;
 
 namespace XfaFlatten.Rendering;
@@ -35,13 +36,32 @@ public sealed class EngineSelector
         {
             "pdfium" => await RenderWithPdfium(inputPath, dpi),
             "playwright" => await RenderWithPlaywright(inputPath, dpi),
+            "xfa-direct" => await RenderWithXfaDirect(inputPath, dpi),
             _ => await RenderAuto(inputPath, dpi, expectedPageCount), // "auto"
         };
     }
 
     private async Task<RenderResult> RenderAuto(string inputPath, int dpi, int expectedPageCount)
     {
-        // Try PDFium first.
+        // Try XFA Direct first for XFA documents (best data binding support).
+        _logger.Info("Trying XFA Direct engine...");
+        var xfaDirectResult = await RenderWithXfaDirect(inputPath, dpi);
+        if (xfaDirectResult.Success)
+        {
+            var xfaValidation = RenderValidator.Validate(xfaDirectResult, expectedPageCount);
+            if (xfaValidation.IsValid)
+            {
+                _logger.Info("XFA Direct engine succeeded.");
+                return xfaDirectResult;
+            }
+            _logger.Warning($"XFA Direct validation failed: {xfaValidation.Message}");
+        }
+        else
+        {
+            _logger.Warning($"XFA Direct failed: {xfaDirectResult.ErrorMessage}");
+        }
+
+        // Fall back to PDFium.
         _logger.Info("Trying PDFium engine...");
         var result = await RenderWithPdfium(inputPath, dpi);
 
@@ -86,6 +106,13 @@ public sealed class EngineSelector
     private async Task<RenderResult> RenderWithPlaywright(string inputPath, int dpi)
     {
         var engine = new PlaywrightEngine(_chromiumPath);
+        _logger.VerboseLog($"Using engine: {engine.Name}");
+        return await engine.RenderAsync(inputPath, dpi, _logger.Verbose);
+    }
+
+    private async Task<RenderResult> RenderWithXfaDirect(string inputPath, int dpi)
+    {
+        var engine = new XfaDirectEngine();
         _logger.VerboseLog($"Using engine: {engine.Name}");
         return await engine.RenderAsync(inputPath, dpi, _logger.Verbose);
     }

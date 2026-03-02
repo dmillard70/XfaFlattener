@@ -24,7 +24,7 @@ var engineOption = new Option<string>(
     name: "--engine",
     getDefaultValue: () => "auto",
     description: "Rendering engine to use: auto, pdfium, or playwright.");
-engineOption.FromAmong("auto", "pdfium", "playwright");
+engineOption.FromAmong("auto", "pdfium", "playwright", "xfa-direct");
 
 var exportXfaOption = new Option<bool>(
     name: "--export-xfa",
