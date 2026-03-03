@@ -111,6 +111,10 @@ public static class XfaPdfWriter
 
         var textRect = new XRect(x, y, w, h);
         DrawTextInRect(gfx, item.Text, font, brush, textRect, item.Para);
+
+        // Draw underline after text (on top)
+        if (item.Font.Underline)
+            DrawUnderline(gfx, item.Text, font, textRect, item.Para);
     }
 
     private static void DrawTextInRect(XGraphics gfx, string text, XFont font,
@@ -119,10 +123,23 @@ public static class XfaPdfWriter
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
         // For multi-line text, use XTextFormatter
-        if (text.Contains('\n') || EstimateTextWidth(text, font) > rect.Width * 1.1)
+        double measuredWidth = gfx.MeasureString(text, font).Width;
+        if (text.Contains('\n') || measuredWidth > rect.Width)
         {
             try
             {
+                // Ensure rect height is tall enough for wrapped text so XTextFormatter
+                // doesn't clip trailing lines. Estimate lines from measured width,
+                // adding 1 extra line to account for word-wrapping overhead (words can't
+                // be split, so real line count is often higher than width-based estimate).
+                double linesNeeded = Math.Ceiling(measuredWidth / Math.Max(rect.Width, 1)) + 1;
+                if (text.Contains('\n'))
+                    linesNeeded = Math.Max(linesNeeded, text.Split('\n').Length + 1);
+                double neededHeight = linesNeeded * font.Height;
+                var drawRect = neededHeight > rect.Height
+                    ? new XRect(rect.X, rect.Y, rect.Width, neededHeight)
+                    : rect;
+
                 var tf = new XTextFormatter(gfx);
                 tf.Alignment = para.HAlign switch
                 {
@@ -132,7 +149,7 @@ public static class XfaPdfWriter
                     _ => XParagraphAlignment.Left
                 };
 
-                tf.DrawString(text, font, brush, rect, XStringFormats.TopLeft);
+                tf.DrawString(text, font, brush, drawRect, XStringFormats.TopLeft);
             }
             catch
             {
@@ -166,6 +183,28 @@ public static class XfaPdfWriter
         };
 
         gfx.DrawString(text, font, brush, rect, format);
+    }
+
+    private static void DrawUnderline(XGraphics gfx, string text, XFont font,
+        XRect rect, XfaPara para)
+    {
+        double textWidth = gfx.MeasureString(text, font).Width;
+        double lineThickness = Math.Max(0.5, font.Size * 0.05);
+
+        // Position underline just below the text baseline.
+        // Baseline is approximately at ascent from top; underline sits slightly below it.
+        double underlineY = rect.Y + font.Size * 1.1;
+
+        // Adjust start X based on horizontal alignment
+        double startX = para.HAlign switch
+        {
+            "center" => rect.X + (rect.Width - textWidth) / 2,
+            "right" => rect.X + rect.Width - textWidth,
+            _ => rect.X
+        };
+
+        var pen = new XPen(DefaultTextColor, lineThickness);
+        gfx.DrawLine(pen, startX, underlineY, startX + textWidth, underlineY);
     }
 
     private static void DrawLine(XGraphics gfx, LayoutItem item)

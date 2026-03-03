@@ -225,8 +225,12 @@ public sealed class XfaTemplateParser
                 if (captTextNode is not null)
                     captionText = captTextNode.InnerText;
             }
-            captionFont = ParseFontElement(captionNode);
-            captionPara = ParseParaElement(captionNode);
+            // Only set captionFont if the caption explicitly defines a <font> element.
+            // Otherwise leave null so the field's own font is used as fallback.
+            if (FindChild(captionNode, "font") is not null)
+                captionFont = ParseFontElement(captionNode);
+            if (FindChild(captionNode, "para") is not null)
+                captionPara = ParseParaElement(captionNode);
         }
 
         double rotate = ParseDouble(GetAttr(node, "rotate")) ?? 0;
@@ -533,8 +537,9 @@ public sealed class XfaTemplateParser
                 fillColor = GetAttr(colorNode, "value");
         }
 
-        bool isVisible = anyEdgeVisible || fillColor is not null;
-        return new XfaBorder(isVisible, thickness, fillColor, strokeColor);
+        // Visible controls stroke border rendering — only true when edges are explicitly visible.
+        // Fill backgrounds are rendered independently via FillColor, regardless of Visible.
+        return new XfaBorder(anyEdgeVisible, thickness, fillColor, strokeColor);
     }
 
     private static string? ParseBindRef(XmlNode node)

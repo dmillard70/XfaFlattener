@@ -595,8 +595,12 @@ public sealed class XfaLayoutEngine
             fieldY = curY;
         }
 
-        // Compute height: use explicit H if set, otherwise estimate from text, but never below MinH
-        double fieldH = field.H ?? EstimateTextHeight(text, field.Font, fieldW, field.Margin);
+        // Compute height: use explicit H if set, otherwise estimate from text, but never below MinH.
+        // If the field has a caption reserve, the text only occupies the remaining width.
+        double estimateW = fieldW;
+        if (field.CaptionReserve.HasValue && (field.CaptionText is not null || field.CaptionBindRef is not null))
+            estimateW -= field.CaptionReserve.Value;
+        double fieldH = field.H ?? EstimateTextHeight(text, field.Font, estimateW, field.Margin);
         fieldH = Math.Max(fieldH, field.MinH ?? 0);
 
         // Handle page overflow: if this field is taller than remaining space on the page,
@@ -1728,7 +1732,9 @@ public sealed class XfaLayoutEngine
 
         double charsPerLine = availW / Math.Max(charWidthMm, 0.5);
 
-        // Count lines from explicit newlines
+        // Count lines using word-level wrapping simulation.
+        // Simple char-division (line.Length / charsPerLine) underestimates because
+        // word-wrapping can't break mid-word — this ensures correct line count.
         var lines = text.Split('\n');
         int totalLines = 0;
         foreach (var line in lines)
@@ -1739,8 +1745,24 @@ public sealed class XfaLayoutEngine
             }
             else
             {
-                int wrappedLines = (int)Math.Ceiling(line.Length / Math.Max(charsPerLine, 1));
-                totalLines += Math.Max(wrappedLines, 1);
+                // Simulate word wrapping
+                var words = line.Split(' ');
+                int lineCount = 1;
+                double lineWidth = 0;
+                foreach (var word in words)
+                {
+                    double wordWidth = word.Length * charWidthMm;
+                    if (lineWidth > 0 && lineWidth + charWidthMm + wordWidth > availW)
+                    {
+                        lineCount++;
+                        lineWidth = wordWidth;
+                    }
+                    else
+                    {
+                        lineWidth += (lineWidth > 0 ? charWidthMm : 0) + wordWidth;
+                    }
+                }
+                totalLines += lineCount;
             }
         }
 
