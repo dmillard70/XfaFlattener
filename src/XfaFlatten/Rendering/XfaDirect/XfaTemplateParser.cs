@@ -61,6 +61,12 @@ public sealed class XfaTemplateParser
                 contentChildren.Add(element);
         }
 
+        // Parse named scripts from <variables> block
+        var namedScripts = ParseVariables(rootSubformNode);
+
+        // Parse scripts from root subform events
+        var rootScripts = ParseScripts(rootSubformNode);
+
         rootSubform = new XfaSubformDef(
             Name: GetAttr(rootSubformNode, "name") ?? "root",
             X: null, Y: null,
@@ -75,7 +81,9 @@ public sealed class XfaTemplateParser
             Border: ParseBorderElement(rootSubformNode),
             ColumnWidths: null,
             HasBreakBefore: false,
-            BreakTarget: null);
+            BreakTarget: null,
+            Scripts: rootScripts.Count > 0 ? rootScripts : null,
+            NamedScripts: namedScripts.Count > 0 ? namedScripts : null);
 
         return new ParseResult(pageAreas, rootSubform);
     }
@@ -239,6 +247,8 @@ public sealed class XfaTemplateParser
         // Check for <setProperty target="caption.value.#text" ref="fieldName"/>
         // This dynamically sets the caption text from a data field
         string? captionBindRef = null;
+        bool hideIfEmpty = false;
+        var scripts = ParseScripts(node);
         foreach (XmlNode child in node.ChildNodes)
         {
             if (child.LocalName == "setProperty")
@@ -248,8 +258,21 @@ public sealed class XfaTemplateParser
                 if (target is not null && target.Contains("caption") && propRef is not null)
                 {
                     captionBindRef = propRef;
-                    break;
                 }
+            }
+        }
+
+        // Derive HideIfEmpty flag from scripts as a fallback for when script engine is not used.
+        // Pattern: if (this.rawValue == null || this.rawValue == "") { this.presence = "hidden"; }
+        // Only match this.rawValue checks (self-value). Do NOT match this.isNull — that has
+        // different semantics. Do NOT match external field checks like "BBUNTERSCHRIFT.rawValue != '1'".
+        foreach (var script in scripts)
+        {
+            if (script.Source.Contains("this.presence") && script.Source.Contains("hidden", StringComparison.OrdinalIgnoreCase)
+                && script.Source.Contains("this.rawValue"))
+            {
+                hideIfEmpty = true;
+                break;
             }
         }
 
@@ -275,7 +298,9 @@ public sealed class XfaTemplateParser
             CaptionPara: captionPara,
             Rotate: rotate,
             Border: border,
-            CaptionBindRef: captionBindRef);
+            CaptionBindRef: captionBindRef,
+            HideIfEmpty: hideIfEmpty,
+            Scripts: scripts.Count > 0 ? scripts : null);
     }
 
     private XfaDrawDef ParseDraw(XmlNode node)
@@ -374,6 +399,10 @@ public sealed class XfaTemplateParser
                 children.Add(element);
         }
 
+        // Extract scripts from events and calculate blocks
+        var scripts = ParseScripts(node);
+        var namedScripts = ParseVariables(node);
+
         // Parse occur
         int occurMin = 1, occurMax = 1;
         var occurNode = FindChild(node, "occur");
@@ -430,7 +459,9 @@ public sealed class XfaTemplateParser
             ColumnWidths: columnWidths,
             HasBreakBefore: hasBreakBefore,
             BreakTarget: breakTarget,
-            BreakTargetType: breakTargetType);
+            BreakTargetType: breakTargetType,
+            Scripts: scripts.Count > 0 ? scripts : null,
+            NamedScripts: namedScripts.Count > 0 ? namedScripts : null);
     }
 
     private XfaSubformSetDef ParseSubformSet(XmlNode node)
@@ -449,6 +480,95 @@ public sealed class XfaTemplateParser
             Name: GetAttr(node, "name"),
             Relation: relation,
             Children: children);
+    }
+
+    // ===================== Script Extraction =====================
+
+    /// <summary>
+    /// Extracts all scripts from &lt;event&gt; and &lt;calculate&gt; child elements.
+    /// </summary>
+    internal static List<XfaScript> ParseScripts(XmlNode parentNode)
+    {
+        var scripts = new List<XfaScript>();
+
+        foreach (XmlNode child in parentNode.ChildNodes)
+        {
+            if (child.NodeType != XmlNodeType.Element) continue;
+
+            if (child.LocalName == "event")
+            {
+                string activity = GetAttr(child, "activity") ?? "ready";
+                var scriptNode = FindChild(child, "script");
+                if (scriptNode is not null)
+                {
+                    string source = scriptNode.InnerText;
+                    if (!string.IsNullOrWhiteSpace(source))
+                    {
+                        string contentType = GetAttr(scriptNode, "contentType") ?? "application/x-javascript";
+                        string runAt = GetAttr(scriptNode, "runAt") ?? "client";
+
+                        // Only extract JavaScript scripts (skip FormCalc)
+                        if (contentType.Contains("javascript", StringComparison.OrdinalIgnoreCase)
+                            || contentType.Contains("ecmascript", StringComparison.OrdinalIgnoreCase))
+                        {
+                            scripts.Add(new XfaScript(source.Trim(), "event", activity, runAt));
+                        }
+                    }
+                }
+            }
+            else if (child.LocalName == "calculate")
+            {
+                var scriptNode = FindChild(child, "script");
+                if (scriptNode is not null)
+                {
+                    string source = scriptNode.InnerText;
+                    if (!string.IsNullOrWhiteSpace(source))
+                    {
+                        string contentType = GetAttr(scriptNode, "contentType") ?? "application/x-javascript";
+                        if (contentType.Contains("javascript", StringComparison.OrdinalIgnoreCase)
+                            || contentType.Contains("ecmascript", StringComparison.OrdinalIgnoreCase))
+                        {
+                            scripts.Add(new XfaScript(source.Trim(), "calculate", "calculate"));
+                        }
+                    }
+                }
+            }
+        }
+
+        return scripts;
+    }
+
+    /// <summary>
+    /// Extracts named scripts from a &lt;variables&gt; block within a subform.
+    /// These are script libraries referenced by name from other scripts.
+    /// </summary>
+    internal static List<XfaNamedScript> ParseVariables(XmlNode subformNode)
+    {
+        var namedScripts = new List<XfaNamedScript>();
+
+        var variablesNode = FindChild(subformNode, "variables");
+        if (variablesNode is null) return namedScripts;
+
+        foreach (XmlNode child in variablesNode.ChildNodes)
+        {
+            if (child.NodeType != XmlNodeType.Element) continue;
+
+            if (child.LocalName == "script")
+            {
+                string? name = GetAttr(child, "name");
+                string source = child.InnerText;
+                string contentType = GetAttr(child, "contentType") ?? "application/x-javascript";
+
+                if (name is not null && !string.IsNullOrWhiteSpace(source)
+                    && (contentType.Contains("javascript", StringComparison.OrdinalIgnoreCase)
+                        || contentType.Contains("ecmascript", StringComparison.OrdinalIgnoreCase)))
+                {
+                    namedScripts.Add(new XfaNamedScript(name, source.Trim()));
+                }
+            }
+        }
+
+        return namedScripts;
     }
 
     // ===================== Helper Parsers =====================

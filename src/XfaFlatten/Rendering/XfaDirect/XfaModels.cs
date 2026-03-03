@@ -57,7 +57,9 @@ public record XfaFieldDef(
     XfaPara? CaptionPara,
     double Rotate,
     XfaBorder Border = default!,
-    string? CaptionBindRef = null) : XfaElement(Name, X, Y, W, H, MinH, Presence);
+    string? CaptionBindRef = null,
+    bool HideIfEmpty = false,
+    List<XfaScript>? Scripts = null) : XfaElement(Name, X, Y, W, H, MinH, Presence);
 
 /// <summary>
 /// A static draw element (text, line, rectangle) from the template.
@@ -102,7 +104,9 @@ public record XfaSubformDef(
     string? ColumnWidths,
     bool HasBreakBefore,
     string? BreakTarget,
-    string? BreakTargetType = null) : XfaElement(Name, X, Y, W, H, MinH, Presence);
+    string? BreakTargetType = null,
+    List<XfaScript>? Scripts = null,
+    List<XfaNamedScript>? NamedScripts = null) : XfaElement(Name, X, Y, W, H, MinH, Presence);
 
 /// <summary>
 /// A subformSet that controls which child subform is chosen (choice/relation).
@@ -159,6 +163,24 @@ public record XfaBorder(
 /// Corner definition for rectangles.
 /// </summary>
 public record XfaCorner(double Radius = 0);
+
+// ===================== Script Models =====================
+
+/// <summary>
+/// A JavaScript/FormCalc script attached to a template element via an event or calculate block.
+/// </summary>
+/// <param name="Source">The script source code.</param>
+/// <param name="Event">The event trigger: "calculate", "initialize", "ready", "enter", "exit", etc.</param>
+/// <param name="Activity">The activity attribute from the event element (e.g., "ready", "initialize").</param>
+/// <param name="RunAt">Where the script runs: "client" (default) or "server".</param>
+public record XfaScript(string Source, string Event, string Activity = "", string RunAt = "client");
+
+/// <summary>
+/// A named script from a subform's &lt;variables&gt; block, acting as a library/function set.
+/// </summary>
+/// <param name="Name">The name attribute (e.g., "oDynamicTable", "dsv_common").</param>
+/// <param name="Source">The JavaScript source code.</param>
+public record XfaNamedScript(string Name, string Source);
 
 // ===================== Layout Output Models =====================
 

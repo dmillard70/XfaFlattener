@@ -198,19 +198,22 @@ public sealed partial class XfaDataParser
             .Replace("&apos;", "'")
             .Replace("&#xA;", "\n");
 
-        // Normalize whitespace per line
+        // Normalize whitespace per line, preserving internal blank lines
+        // (empty <p> paragraphs in XFA rich text act as line spacers)
         var lines = processed.Split('\n');
+        var result = new List<string>(lines.Length);
         foreach (var line in lines)
-        {
-            string trimmed = line.Trim();
-            if (trimmed.Length > 0)
-            {
-                if (sb.Length > 0) sb.Append('\n');
-                sb.Append(trimmed);
-            }
-        }
+            result.Add(line.Trim());
 
-        return sb.ToString();
+        // Trim leading and trailing empty lines for the plain-text path.
+        // The per-segment rich text path (ParseRichTextSegments) handles
+        // intentional blank paragraphs with finer control.
+        while (result.Count > 0 && result[0].Length == 0)
+            result.RemoveAt(0);
+        while (result.Count > 0 && result[^1].Length == 0)
+            result.RemoveAt(result.Count - 1);
+
+        return string.Join('\n', result);
     }
 
     /// <summary>
@@ -257,8 +260,10 @@ public sealed partial class XfaDataParser
                     && next.Underline == current.Underline && next.FontSizePt == current.FontSizePt
                     && next.FontFamily == current.FontFamily)
                 {
-                    // Merge: join with newline
-                    current = current with { Text = current.Text.TrimEnd('\n') + "\n" + next.Text };
+                    // Merge: preserve existing newlines (including blank lines from empty paragraphs)
+                    current = current.Text.EndsWith('\n')
+                        ? current with { Text = current.Text + next.Text }
+                        : current with { Text = current.Text + "\n" + next.Text };
                 }
                 else
                 {
@@ -268,6 +273,17 @@ public sealed partial class XfaDataParser
             }
             consolidated.Add(current);
             segments = consolidated;
+        }
+
+        // Trim trailing blank lines from the last segment (matching StripHtmlToPlainText
+        // behavior). Trailing empty paragraphs in XFA rich text (xfa-spacerun spacers)
+        // don't produce visible output in Adobe's renderer.
+        if (segments.Count > 0)
+        {
+            var last = segments[^1];
+            string trimmed = last.Text.TrimEnd('\n');
+            if (trimmed.Length != last.Text.Length)
+                segments[^1] = last with { Text = trimmed };
         }
 
         return segments;
@@ -351,7 +367,7 @@ public sealed partial class XfaDataParser
                 }
             }
 
-            // For <p> elements, start a new segment (paragraph break)
+            // For <p> elements, handle paragraph breaks and empty paragraph detection
             if (localName == "p")
             {
                 // Add paragraph break if there's existing content
@@ -360,6 +376,31 @@ public sealed partial class XfaDataParser
                     var prev = segments[^1];
                     segments[^1] = prev with { Text = prev.Text + "\n" };
                 }
+
+                int countBefore = segments.Count;
+                string? lastTextBefore = segments.Count > 0 ? segments[^1].Text : null;
+
+                WalkForSegments(child, bold, italic, underline, fontSize, segments, fontFamily);
+
+                // If this <p> had no visible text (empty/whitespace-only paragraph like
+                // xfa-spacerun spacers), preserve it as a blank line in the output.
+                bool wasEmpty = (segments.Count == countBefore) &&
+                                (lastTextBefore is null || segments[^1].Text == lastTextBefore);
+                if (wasEmpty)
+                {
+                    if (segments.Count > 0)
+                    {
+                        var prev = segments[^1];
+                        segments[^1] = prev with { Text = prev.Text + "\n" };
+                    }
+                    else
+                    {
+                        // Very first paragraph is empty — create initial segment with blank line
+                        segments.Add(new RichTextSegment("\n", bold, italic, underline, fontSize, fontFamily));
+                    }
+                }
+
+                continue;
             }
 
             WalkForSegments(child, bold, italic, underline, fontSize, segments, fontFamily);

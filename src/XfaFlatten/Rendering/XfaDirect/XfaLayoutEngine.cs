@@ -15,12 +15,21 @@ public sealed class XfaLayoutEngine
     private int _totalPages;
     private int _currentPageAreaIdx; // Track which page area is active
     private readonly List<int> _pageToAreaMap = new(); // Maps page index → page area index
+    private readonly XfaScriptEngine? _scriptEngine;
 
-    public XfaLayoutEngine(List<XfaPageArea> pageAreas, XfaData data, bool verbose)
+    // Track element → page assignments for layout:ready scripts
+    private readonly Dictionary<string, int> _elementPageMap = new(StringComparer.OrdinalIgnoreCase);
+
+    // Track script-created element proxies for parent chain navigation
+    private readonly Dictionary<string, XfaElementProxy> _proxyCache = new(StringComparer.OrdinalIgnoreCase);
+
+    public XfaLayoutEngine(List<XfaPageArea> pageAreas, XfaData data, bool verbose,
+        XfaScriptEngine? scriptEngine = null)
     {
         _pageAreas = pageAreas;
         _data = data;
         _verbose = verbose;
+        _scriptEngine = scriptEngine;
 
         // Build name→index map for page area lookup
         _pageAreaByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -40,14 +49,68 @@ public sealed class XfaLayoutEngine
 
     /// <summary>
     /// Performs layout of the root subform, producing positioned items.
+    /// Supports two-pass layout: if a script engine is present and layout:ready scripts exist,
+    /// the first pass computes page assignments, executes layout:ready scripts, then re-layouts.
     /// </summary>
     public LayoutResult Layout(XfaSubformDef rootSubform)
+    {
+        // Register named scripts from the root subform (and recursively from children)
+        if (_scriptEngine is not null)
+        {
+            RegisterNamedScriptsRecursive(rootSubform);
+            _scriptEngine.InitializeNamedScripts();
+
+            if (_verbose)
+            {
+                int contentScripts = CountScriptsRecursive(rootSubform);
+                int pageAreaScripts = 0;
+                foreach (var pa in _pageAreas)
+                    foreach (var el in pa.StaticElements)
+                        pageAreaScripts += CountScriptsRecursive(el);
+                Console.WriteLine($"  [Script] Total scripts: {contentScripts + pageAreaScripts} ({contentScripts} content, {pageAreaScripts} page area)");
+            }
+        }
+
+        // Pass 1: Layout with calculate/initialize scripts
+        PerformLayoutPass(rootSubform);
+
+        // Check if layout:ready scripts exist and need a second pass
+        if (_scriptEngine is not null && HasLayoutReadyScripts(rootSubform))
+        {
+            // Set layout info so page() and pageCount() work
+            _scriptEngine.SetLayoutInfo(_totalPages, _elementPageMap);
+
+            // Execute layout:ready scripts
+            ExecuteLayoutReadyScripts(rootSubform, _data.Root);
+
+            if (_scriptEngine.HasLayoutReadyModifications)
+            {
+                if (_verbose)
+                    Console.WriteLine("  [Layout] Re-layout triggered by layout:ready script modifications");
+
+                // Pass 2: Re-layout with script-modified values
+                PerformLayoutPass(rootSubform);
+            }
+        }
+
+        // Post-process: inject page numbers where possible
+        InjectPageNumbers();
+
+        return new LayoutResult(_items, _totalPages, new List<int>(_pageToAreaMap));
+    }
+
+    /// <summary>
+    /// Performs a single layout pass.
+    /// </summary>
+    private void PerformLayoutPass(XfaSubformDef rootSubform)
     {
         _currentPage = 0;
         _currentPageAreaIdx = 0;
         _pageToAreaMap.Clear();
         _pageToAreaMap.Add(_currentPageAreaIdx); // Page 0 uses first page area
         _items.Clear();
+        _elementPageMap.Clear();
+        _proxyCache.Clear();
 
         // Start data context from the root data node
         var dataCtx = _data.Root;
@@ -59,11 +122,6 @@ public sealed class XfaLayoutEngine
         LayoutSubform(rootSubform, ca.X, ref curY, ca.W, ca.Y + ca.H, dataCtx);
 
         _totalPages = _currentPage + 1;
-
-        // Post-process: inject page numbers where possible
-        InjectPageNumbers();
-
-        return new LayoutResult(_items, _totalPages, new List<int>(_pageToAreaMap));
     }
 
     private double LayoutElement(XfaElement element, double x, ref double curY,
@@ -278,6 +336,9 @@ public sealed class XfaLayoutEngine
 
             double innerY = startY;
 
+            // Save the starting page before children are laid out (children may advance pages)
+            int startPage = _currentPage;
+
             switch (subform.Layout)
             {
                 case "tb":
@@ -304,10 +365,22 @@ public sealed class XfaLayoutEngine
 
             double subformH = innerY - startY + marginBottom;
 
-            // Emit subform border/fill after knowing the final height
-            // Only emit borders on subforms that are visual containers (have fill) or table/row elements.
-            // Flow containers (tb, lr-tb) without fill are structural and shouldn't render borders.
-            EmitSubformBorder(subform, subformX, startY - marginTop, subformW, subformH + marginTop);
+            // Emit subform border/fill on the page where the subform started.
+            // If the subform spans multiple pages (children advanced _currentPage),
+            // clamp the border height to the remaining space on the starting page.
+            int savedPage = _currentPage;
+            if (_currentPage != startPage)
+            {
+                // Subform spans pages — emit border on start page, clipped to page bottom
+                _currentPage = startPage;
+                double clampedH = pageBottom - (startY - marginTop);
+                EmitSubformBorder(subform, subformX, startY - marginTop, subformW, clampedH, dataCtx);
+                _currentPage = savedPage;
+            }
+            else
+            {
+                EmitSubformBorder(subform, subformX, startY - marginTop, subformW, subformH + marginTop, dataCtx);
+            }
 
             curY = startY + subformH;
             totalH += subformH + marginTop;
@@ -346,6 +419,9 @@ public sealed class XfaLayoutEngine
         double startY = curY + marginTop;
         double innerY = startY;
 
+        // Save the starting page before children are laid out
+        int startPage = _currentPage;
+
         switch (subform.Layout)
         {
             case "tb":
@@ -371,8 +447,19 @@ public sealed class XfaLayoutEngine
 
         double subformH = innerY - startY + marginBottom;
 
-        // Emit subform border/fill after knowing the final height
-        EmitSubformBorder(subform, subformX, startY - marginTop, subformW, subformH + marginTop);
+        // Emit subform border/fill on the page where the subform started.
+        int savedPage = _currentPage;
+        if (_currentPage != startPage)
+        {
+            _currentPage = startPage;
+            double clampedH = pageBottom - (startY - marginTop);
+            EmitSubformBorder(subform, subformX, startY - marginTop, subformW, clampedH, dataCtx);
+            _currentPage = savedPage;
+        }
+        else
+        {
+            EmitSubformBorder(subform, subformX, startY - marginTop, subformW, subformH + marginTop, dataCtx);
+        }
 
         curY = startY + subformH;
         return subformH + marginTop;
@@ -426,8 +513,19 @@ public sealed class XfaLayoutEngine
             }
 
             double tempY = curY;
-            double childH = LayoutElement(child, curX - (child.X.HasValue ? 0 : 0), ref tempY, childW, pageBottom, dataCtx);
-            if (childH <= 0) childH = child.H ?? child.MinH ?? 0;
+            // In lr-tb flow, explicit x/y on children should be ignored — positions
+            // are determined by the flow engine. Subtract child.X so LayoutField's
+            // fieldX = x + (field.X ?? 0) nets out to just curX.
+            double childH = LayoutElement(child, curX - (child.X ?? 0), ref tempY, childW, pageBottom, dataCtx);
+            if (childH <= 0)
+            {
+                // Don't override height for fields hidden by HideIfEmpty JS evaluation —
+                // LayoutField intentionally returned 0 because the field's script hides it when empty.
+                bool isJsHidden = child is XfaFieldDef f && f.HideIfEmpty
+                    && string.IsNullOrEmpty(ResolveFieldValue(f, dataCtx));
+                if (!isJsHidden)
+                    childH = child.H ?? child.MinH ?? 0;
+            }
 
             curX += childW;
             rowH = Math.Max(rowH, childH);
@@ -559,14 +657,55 @@ public sealed class XfaLayoutEngine
     private double LayoutField(XfaFieldDef field, double x, ref double curY,
         double availW, double pageBottom, XfaDataNode? dataCtx, double? forceWidth = null)
     {
-        if (field.Presence is "hidden" or "inactive")
+        // Check script-modified presence first (from previous script execution)
+        string? effectivePresence = field.Presence;
+        string fieldPath = BuildElementPath(field, dataCtx);
+
+        if (_scriptEngine is not null)
+        {
+            string? scriptPresence = _scriptEngine.GetModifiedPresence(fieldPath);
+            if (scriptPresence is not null)
+                effectivePresence = scriptPresence;
+        }
+
+        if (effectivePresence is "hidden" or "inactive")
             return 0;
 
         // Skip invisible but still return height so layout flows correctly
-        bool invisible = field.Presence == "invisible";
+        bool invisible = effectivePresence == "invisible";
 
         // Resolve value and detect rich text formatting
         string text = ResolveFieldValue(field, dataCtx);
+
+        // Execute calculate scripts via Jint if available.
+        // Phase 1: only "calculate" scripts (value computation, parent value copy chains).
+        // "ready" event scripts that handle visibility are covered by the HideIfEmpty fallback.
+        // "ready" layout scripts (xfa.layout.page) are handled in the two-pass layout (Phase 2).
+        if (_scriptEngine is not null && field.Scripts is not null)
+        {
+            foreach (var script in field.Scripts)
+            {
+                if (script.Event == "calculate")
+                {
+                    var proxy = BuildFieldProxy(field, dataCtx, text, fieldPath);
+                    _scriptEngine.Execute(script.Source, proxy, $"{field.Name}/{script.Event}");
+                }
+            }
+
+            // Check if a calculate script modified the value
+            string? modifiedValue = _scriptEngine.GetModifiedValue(fieldPath);
+            if (modifiedValue is not null)
+                text = modifiedValue;
+        }
+
+        // Track page assignment for layout:ready scripts
+        _elementPageMap[fieldPath] = _currentPage;
+
+        // Evaluate JS "hide if empty" pattern as fallback (when script engine didn't handle it):
+        // fields with scripts like if (this.rawValue == null) { this.presence = "hidden"; }
+        // When the resolved value is empty, treat the field as hidden (0 height).
+        if (field.HideIfEmpty && string.IsNullOrEmpty(text))
+            return 0;
         var (dataBold, dataItalic) = DetectRichTextFormatting(field, dataCtx);
 
         // Add spaceBefore from paragraph settings
@@ -595,13 +734,23 @@ public sealed class XfaLayoutEngine
             fieldY = curY;
         }
 
-        // Compute height: use explicit H if set, otherwise estimate from text, but never below MinH.
-        // If the field has a caption reserve, the text only occupies the remaining width.
-        double estimateW = fieldW;
-        if (field.CaptionReserve.HasValue && (field.CaptionText is not null || field.CaptionBindRef is not null))
-            estimateW -= field.CaptionReserve.Value;
-        double fieldH = field.H ?? EstimateTextHeight(text, field.Font, estimateW, field.Margin);
-        fieldH = Math.Max(fieldH, field.MinH ?? 0);
+        // Compute height: use explicit H if set, otherwise use the field's bottom margin.
+        // Invisible fields take up layout space but are not rendered (XFA spec).
+        // element_leerzeile: minH=4mm, bottomInset=2mm. Using 2mm gives correct 11-page count.
+        double fieldH;
+        if (invisible)
+        {
+            fieldH = field.H ?? field.Margin.Bottom;
+        }
+        else
+        {
+            // If the field has a caption reserve, the text only occupies the remaining width.
+            double estimateW = fieldW;
+            if (field.CaptionReserve.HasValue && (field.CaptionText is not null || field.CaptionBindRef is not null))
+                estimateW -= field.CaptionReserve.Value;
+            fieldH = field.H ?? EstimateTextHeight(text, field.Font, estimateW, field.Margin);
+            fieldH = Math.Max(fieldH, field.MinH ?? 0);
+        }
 
         // Handle page overflow: if this field is taller than remaining space on the page,
         // split it across pages. This handles long rich text blocks.
@@ -656,8 +805,8 @@ public sealed class XfaLayoutEngine
                         foreach (var line in segText.Split('\n'))
                         {
                             string trimmed = line.Trim();
-                            if (trimmed.Length > 0)
-                                fmtLines.Add((trimmed, seg.Bold, seg.Italic, seg.Underline, seg.FontSizePt, seg.FontFamily));
+                            // Preserve empty lines (blank paragraph spacers from XFA rich text)
+                            fmtLines.Add((trimmed, seg.Bold, seg.Italic, seg.Underline, seg.FontSizePt, seg.FontFamily));
                         }
                     }
                 }
@@ -793,7 +942,7 @@ public sealed class XfaLayoutEngine
                     X: textX, Y: textY, W: captionW, H: textH,
                     Text: captionText,
                     Font: field.CaptionFont ?? renderFont,
-                    Para: field.CaptionPara ?? field.Para,
+                    Para: field.CaptionPara ?? new XfaPara(),
                     Rotate: field.Rotate));
 
                 textX += captionW;
@@ -810,12 +959,19 @@ public sealed class XfaLayoutEngine
             if (dataNode?.RichTextHtml is not null)
             {
                 var segments = XfaDataParser.ParseRichTextSegments(dataNode.RichTextHtml);
+                // Use per-segment rendering when formatting differs, or when blank
+                // paragraphs exist (empty <p> elements produce leading/internal "\n\n").
+                // The per-segment path preserves blank lines that StripHtmlToPlainText trims.
                 bool hasFormatting = segments.Count > 1
                     || (segments.Count == 1 && (segments[0].Bold || segments[0].Italic
-                        || segments[0].FontSizePt.HasValue || segments[0].FontFamily is not null));
+                        || segments[0].FontSizePt.HasValue || segments[0].FontFamily is not null
+                        || segments[0].Text.Contains("\n\n")));
                 if (hasFormatting)
                 {
-                    // Emit per-segment layout items with individual formatting and font sizes
+                    // Emit per-segment layout items with individual formatting and font sizes.
+                    // Trailing newlines are trimmed from the rendered text, but their height is
+                    // still counted in fieldH so the field box includes blank space below the text
+                    // (matching the reference output for fields with trailing blank <p> paragraphs).
                     double segY = textY;
                     foreach (var seg in segments)
                     {
@@ -857,6 +1013,22 @@ public sealed class XfaLayoutEngine
 
                         segY += segH;
                     }
+                    // Compute full field height from untrimmed segment text so that
+                    // trailing blank paragraphs (empty <p> elements) still contribute to
+                    // the field's allocated space, even though the rendered text is trimmed.
+                    double fullContentH = 0;
+                    foreach (var seg2 in segments)
+                    {
+                        double fs = seg2.FontSizePt ?? renderFont.SizePt;
+                        double lh = fs * 0.3528 * 1.2;
+                        int lc = 1;
+                        foreach (char c in seg2.Text)
+                            if (c == '\n') lc++;
+                        fullContentH += lc * lh;
+                    }
+                    double fullH = fullContentH + field.Margin.Top + field.Margin.Bottom;
+                    if (fullH > fieldH)
+                        fieldH = fullH;
                     goto fieldDone;
                 }
             }
@@ -871,10 +1043,33 @@ public sealed class XfaLayoutEngine
             fieldDone:;
         }
 
-        // Emit border/fill for fields
+        // Emit border/fill for fields. Skip background fill for empty fields
+        // with fill colors (e.g., empty h3 header bars) — Adobe doesn't render
+        // backgrounds for fields with no visible text content.
         if (!invisible)
         {
-            EmitBorder(field.Border, fieldX, fieldY, fieldW, fieldH);
+            if (string.IsNullOrEmpty(text) && field.Border.FillColor is not null
+                && field.CaptionText is null)
+            {
+                // Emit stroke border only, no fill
+                if (field.Border.Visible && field.Border.Thickness > 0)
+                {
+                    double thicknessPt = field.Border.Thickness * (72.0 / 25.4);
+                    _items.Add(new LayoutItem(
+                        PageIndex: _currentPage,
+                        X: fieldX, Y: fieldY, W: fieldW, H: fieldH,
+                        Text: "",
+                        Font: new XfaFont(),
+                        Para: new XfaPara(),
+                        ItemType: LayoutItemType.Rectangle,
+                        StrokeColor: field.Border.StrokeColor,
+                        StrokeThicknessPt: thicknessPt));
+                }
+            }
+            else
+            {
+                EmitBorder(field.Border, fieldX, fieldY, fieldW, fieldH);
+            }
         }
 
         // Always advance curY for flowing content (tb, lr-tb, table cell contexts).
@@ -1450,14 +1645,10 @@ public sealed class XfaLayoutEngine
 
     private void InjectPageNumbers()
     {
-        // Replace page number placeholders
-        foreach (var item in _items.ToList())
+        // Set layout info on the script engine so page() and pageCount() work
+        if (_scriptEngine is not null)
         {
-            if (item.Text.Contains("xfa.layout.page") || item.Text.Contains("xfa.layout.pageCount"))
-            {
-                // These are JavaScript-computed fields we can't evaluate.
-                // We substitute with the actual page info.
-            }
+            _scriptEngine.SetLayoutInfo(_totalPages, _elementPageMap);
         }
 
         // Add page number items for each page from page area static elements that have
@@ -1497,6 +1688,52 @@ public sealed class XfaLayoutEngine
                 {
                     string text = ResolveFieldValue(field, _data.Root);
 
+                    // Execute layout:ready scripts for page area fields (e.g., page number fields)
+                    if (_scriptEngine is not null && field.Scripts is not null)
+                    {
+                        foreach (var script in field.Scripts)
+                        {
+                            if (script.Activity == "ready" && script.Source.Contains("xfa.layout"))
+                            {
+                                // Build a proxy with the current page number
+                                string fieldPath = $"pageArea.{pageArea.Name}.{field.Name}.p{p}";
+                                var proxy = new XfaElementProxy(
+                                    _scriptEngine,
+                                    fieldPath,
+                                    field.Name,
+                                    text,
+                                    field.Presence ?? "visible",
+                                    null, field, null);
+
+                                // Override the page lookup for this specific element
+                                _elementPageMap[field.Name ?? ""] = p;
+
+                                _scriptEngine.Execute(script.Source, proxy, $"{field.Name}/layout:ready[p{p}]");
+
+                                string? modifiedValue = _scriptEngine.GetModifiedValue(fieldPath);
+                                if (modifiedValue is not null)
+                                    text = modifiedValue;
+                            }
+                            else if (script.Event == "calculate")
+                            {
+                                string fieldPath = $"pageArea.{pageArea.Name}.{field.Name}.p{p}.calc";
+                                var proxy = new XfaElementProxy(
+                                    _scriptEngine,
+                                    fieldPath,
+                                    field.Name,
+                                    text,
+                                    field.Presence ?? "visible",
+                                    null, field, null);
+
+                                _scriptEngine.Execute(script.Source, proxy, $"{field.Name}/calculate[p{p}]");
+
+                                string? modifiedValue = _scriptEngine.GetModifiedValue(fieldPath);
+                                if (modifiedValue is not null)
+                                    text = modifiedValue;
+                            }
+                        }
+                    }
+
                     if (!string.IsNullOrEmpty(text))
                     {
                         double fx = field.X.Value + field.Margin.Left;
@@ -1515,7 +1752,7 @@ public sealed class XfaLayoutEngine
                                 X: fx, Y: fy, W: field.CaptionReserve.Value, H: fh,
                                 Text: field.CaptionText,
                                 Font: field.CaptionFont ?? field.Font,
-                                Para: field.CaptionPara ?? field.Para,
+                                Para: field.CaptionPara ?? new XfaPara(),
                                 Rotate: field.Rotate));
                             fx += field.CaptionReserve.Value;
                             fw -= field.CaptionReserve.Value;
@@ -1570,6 +1807,36 @@ public sealed class XfaLayoutEngine
             if (child is XfaFieldDef f && f.Presence is not "hidden" and not "inactive" and not "invisible")
             {
                 string text = ResolveFieldValue(f, dataCtx);
+
+                // Execute scripts on page area fields (page numbers, date fields, etc.)
+                if (_scriptEngine is not null && f.Scripts is not null)
+                {
+                    foreach (var script in f.Scripts)
+                    {
+                        string fieldPath = $"pageAreaSub.{subform.Name}.{f.Name}.p{pageIndex}";
+                        if (script.Activity == "ready" && script.Source.Contains("xfa.layout"))
+                        {
+                            var proxy = new XfaElementProxy(
+                                _scriptEngine, fieldPath, f.Name, text,
+                                f.Presence ?? "visible", null, f, null);
+                            _elementPageMap[f.Name ?? ""] = pageIndex;
+                            _scriptEngine.Execute(script.Source, proxy, $"{f.Name}/layout:ready[p{pageIndex}]");
+                            string? modVal = _scriptEngine.GetModifiedValue(fieldPath);
+                            if (modVal is not null) text = modVal;
+                        }
+                        else if (script.Event == "calculate")
+                        {
+                            string calcPath = fieldPath + ".calc";
+                            var proxy = new XfaElementProxy(
+                                _scriptEngine, calcPath, f.Name, text,
+                                f.Presence ?? "visible", null, f, null);
+                            _scriptEngine.Execute(script.Source, proxy, $"{f.Name}/calculate[p{pageIndex}]");
+                            string? modVal = _scriptEngine.GetModifiedValue(calcPath);
+                            if (modVal is not null) text = modVal;
+                        }
+                    }
+                }
+
                 if (!string.IsNullOrEmpty(text) || f.CaptionText is not null)
                 {
                     double fx, fy, fw, fh;
@@ -1604,7 +1871,7 @@ public sealed class XfaLayoutEngine
                             X: fx, Y: fy, W: f.CaptionReserve.Value, H: fh,
                             Text: f.CaptionText,
                             Font: f.CaptionFont ?? f.Font,
-                            Para: f.CaptionPara ?? f.Para,
+                            Para: f.CaptionPara ?? new XfaPara(),
                             Rotate: f.Rotate));
                         fx += f.CaptionReserve.Value;
                         fw -= f.CaptionReserve.Value;
@@ -1623,6 +1890,12 @@ public sealed class XfaLayoutEngine
                 }
             }
 
+            // Recurse into nested subforms within page area
+            if (child is XfaSubformDef nestedSubform)
+            {
+                RenderPageAreaSubform(nestedSubform, pageIndex);
+            }
+
             if (!child.X.HasValue || !child.Y.HasValue)
             {
                 curX += childW;
@@ -1638,10 +1911,28 @@ public sealed class XfaLayoutEngine
     /// and borders with explicit edge colors. Table/row subforms and subforms with fills always render.
     /// This prevents structural wrapper subforms from rendering unwanted border rectangles.
     /// </summary>
-    private void EmitSubformBorder(XfaSubformDef subform, double x, double y, double w, double h)
+    private void EmitSubformBorder(XfaSubformDef subform, double x, double y, double w, double h,
+        XfaDataNode? dataCtx = null)
     {
         if (w <= 0 || h <= 0) return;
         var border = subform.Border;
+        bool borderVisible = border.Visible;
+        double borderThickness = border.Thickness;
+
+        // Simulate JavaScript-driven borders: XFA forms use a common pattern where a
+        // hidden "inkl_rahmen" checkbox controls border visibility on a sibling "Rahmen"
+        // subform via JS: if (inkl_rahmen != 1) Rahmen.borderWidth = "0pt".
+        // Since we can't execute JS, check the data directly.
+        if (!borderVisible && subform.Name == "Rahmen" && dataCtx is not null)
+        {
+            var inklRahmen = dataCtx.GetChildren("inkl_rahmen");
+            if (inklRahmen.Count > 0 && inklRahmen[0].TextValue == "1")
+            {
+                borderVisible = true;
+                if (borderThickness <= 0) borderThickness = 0.2; // default XFA border thickness
+            }
+        }
+
 
         // Always emit fill background
         if (border.FillColor is not null)
@@ -1658,10 +1949,11 @@ public sealed class XfaLayoutEngine
 
         // Render stroked border if visible. Subforms without a <border> element get
         // Visible=false by default, so structural wrappers won't render unwanted borders.
-        // Only subforms with an explicit visible <edge> in their <border> get Visible=true.
-        if (border.Visible && border.Thickness > 0)
+        // Only subforms with an explicit visible <edge> in their <border> get Visible=true,
+        // or JS-simulated borders are active (e.g., Rahmen with inkl_rahmen=1).
+        if (borderVisible && borderThickness > 0)
         {
-            double thicknessPt = border.Thickness * (72.0 / 25.4);
+            double thicknessPt = borderThickness * (72.0 / 25.4);
             _items.Add(new LayoutItem(
                 PageIndex: _currentPage,
                 X: x, Y: y, W: w, H: h,
@@ -1712,14 +2004,305 @@ public sealed class XfaLayoutEngine
         }
     }
 
+    // ===================== Script Execution Helpers =====================
+
+    /// <summary>
+    /// Builds a unique path for an element used as a key for script modifications.
+    /// </summary>
+    private static string BuildElementPath(XfaElement element, XfaDataNode? dataCtx)
+    {
+        string name = element.Name ?? "anon";
+        string dataPath = dataCtx?.Name ?? "root";
+        // Use a combination of template name + data context to handle repeated elements
+        return $"{dataPath}.{name}";
+    }
+
+    /// <summary>
+    /// Creates a proxy for a field element that Jint scripts can interact with.
+    /// </summary>
+    private XfaElementProxy BuildFieldProxy(XfaFieldDef field, XfaDataNode? dataCtx,
+        string resolvedValue, string fieldPath)
+    {
+        // Check cache first
+        if (_proxyCache.TryGetValue(fieldPath, out var cached))
+        {
+            // Update the value in case data resolution changed it
+            cached.rawValue = resolvedValue;
+            return cached;
+        }
+
+        // Build parent proxy chain for navigation (this.parent.parent.kopfzeile.xxx.rawValue)
+        XfaElementProxy? parentProxy = null;
+        if (dataCtx?.Parent is not null)
+        {
+            parentProxy = BuildDataNodeProxy(dataCtx.Parent, fieldPath + ".$parent", 0);
+        }
+
+        var proxy = new XfaElementProxy(
+            _scriptEngine!,
+            fieldPath,
+            field.Name,
+            resolvedValue,
+            field.Presence ?? "visible",
+            dataCtx is not null ? FindDataNodeForField(field, dataCtx) : null,
+            field,
+            parentProxy);
+
+        _proxyCache[fieldPath] = proxy; // Cache before adding children
+
+        // Add sibling/child data nodes as shallow navigable children
+        if (dataCtx is not null)
+        {
+            foreach (var sibling in dataCtx.Children)
+            {
+                if (!string.IsNullOrEmpty(sibling.Name))
+                {
+                    string childPath = $"{fieldPath}.{sibling.Name}";
+                    if (!_proxyCache.ContainsKey(childPath))
+                    {
+                        var childProxy = new XfaElementProxy(
+                            _scriptEngine!,
+                            childPath,
+                            sibling.Name,
+                            sibling.TextValue,
+                            "visible",
+                            sibling,
+                            null,
+                            proxy);
+                        _proxyCache[childPath] = childProxy;
+                        proxy.AddChild(sibling.Name, childProxy);
+                    }
+                    else
+                    {
+                        proxy.AddChild(sibling.Name, _proxyCache[childPath]);
+                    }
+                }
+            }
+        }
+
+        // Add caption proxy if field has a caption
+        if (field.CaptionReserve.HasValue)
+        {
+            proxy.caption = new XfaCaptionProxy(field.CaptionReserve.Value);
+        }
+
+        return proxy;
+    }
+
+    /// <summary>
+    /// Builds a proxy for a data node, used for parent chain navigation.
+    /// Limited to a max depth to avoid stack overflow on deep data trees.
+    /// Children are built lazily (only direct children, not recursive).
+    /// </summary>
+    private XfaElementProxy BuildDataNodeProxy(XfaDataNode dataNode, string basePath, int depth = 0)
+    {
+        if (_proxyCache.TryGetValue(basePath, out var cached))
+            return cached;
+
+        // Limit parent chain depth to prevent stack overflow
+        XfaElementProxy? parentProxy = null;
+        if (dataNode.Parent is not null && depth < 10)
+        {
+            string parentPath = basePath.Contains(".$parent")
+                ? basePath + ".$parent"
+                : basePath + ".$parent";
+            parentProxy = BuildDataNodeProxy(dataNode.Parent, parentPath, depth + 1);
+        }
+
+        var proxy = new XfaElementProxy(
+            _scriptEngine!,
+            basePath,
+            dataNode.Name,
+            dataNode.TextValue,
+            "visible",
+            dataNode,
+            null,
+            parentProxy);
+
+        _proxyCache[basePath] = proxy; // Cache before adding children to prevent cycles
+
+        // Add only direct children (non-recursive) for property navigation
+        foreach (var child in dataNode.Children)
+        {
+            if (!string.IsNullOrEmpty(child.Name))
+            {
+                string childPath = $"{basePath}.{child.Name}";
+                if (!_proxyCache.ContainsKey(childPath))
+                {
+                    // Create a shallow child proxy (no recursion into grandchildren)
+                    var childProxy = new XfaElementProxy(
+                        _scriptEngine!,
+                        childPath,
+                        child.Name,
+                        child.TextValue,
+                        "visible",
+                        child,
+                        null,
+                        proxy); // Parent is this proxy
+                    _proxyCache[childPath] = childProxy;
+                    proxy.AddChild(child.Name, childProxy);
+                }
+                else
+                {
+                    proxy.AddChild(child.Name, _proxyCache[childPath]);
+                }
+            }
+        }
+
+        return proxy;
+    }
+
+    /// <summary>
+    /// Find the data node that corresponds to a field (for script proxy binding).
+    /// </summary>
+    private XfaDataNode? FindDataNodeForField(XfaFieldDef field, XfaDataNode dataCtx)
+    {
+        if (field.Name is null) return null;
+
+        // Try direct child
+        var children = dataCtx.GetChildren(field.Name);
+        if (children.Count > 0) return children[0];
+
+        // Try global
+        if (_data.NodesByName.TryGetValue(field.Name, out var nodes) && nodes.Count > 0)
+            return nodes[0];
+
+        return null;
+    }
+
+    /// <summary>
+    /// Counts total scripts across all elements recursively (diagnostic).
+    /// </summary>
+    private static int CountScriptsRecursive(XfaElement element)
+    {
+        int count = 0;
+        if (element is XfaFieldDef f && f.Scripts is not null) count += f.Scripts.Count;
+        if (element is XfaSubformDef s)
+        {
+            if (s.Scripts is not null) count += s.Scripts.Count;
+            foreach (var c in s.Children) count += CountScriptsRecursive(c);
+        }
+        if (element is XfaSubformSetDef ss)
+            foreach (var c in ss.Children) count += CountScriptsRecursive(c);
+        return count;
+    }
+
+    /// <summary>
+    /// Recursively register all named scripts from subform variables blocks.
+    /// </summary>
+    private void RegisterNamedScriptsRecursive(XfaSubformDef subform)
+    {
+        if (subform.NamedScripts is not null)
+        {
+            foreach (var ns in subform.NamedScripts)
+            {
+                _scriptEngine!.RegisterNamedScript(ns.Name, ns.Source);
+            }
+        }
+
+        foreach (var child in subform.Children)
+        {
+            if (child is XfaSubformDef childSubform)
+                RegisterNamedScriptsRecursive(childSubform);
+        }
+    }
+
+    /// <summary>
+    /// Check if any element in the tree has layout:ready scripts.
+    /// </summary>
+    private static bool HasLayoutReadyScripts(XfaSubformDef subform)
+    {
+        if (subform.Scripts is not null)
+        {
+            foreach (var s in subform.Scripts)
+            {
+                if (s.Activity == "ready" && s.Source.Contains("xfa.layout"))
+                    return true;
+            }
+        }
+
+        foreach (var child in subform.Children)
+        {
+            if (child is XfaFieldDef field && field.Scripts is not null)
+            {
+                foreach (var s in field.Scripts)
+                {
+                    if (s.Activity == "ready" && s.Source.Contains("xfa.layout"))
+                        return true;
+                }
+            }
+            else if (child is XfaSubformDef childSubform)
+            {
+                if (HasLayoutReadyScripts(childSubform))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Execute layout:ready scripts after the first layout pass.
+    /// These scripts typically set page numbers: this.rawValue = xfa.layout.page(this)
+    /// </summary>
+    private void ExecuteLayoutReadyScripts(XfaElement element, XfaDataNode? dataCtx)
+    {
+        if (element is XfaFieldDef field && field.Scripts is not null)
+        {
+            string fieldPath = BuildElementPath(field, dataCtx);
+            string text = ResolveFieldValue(field, dataCtx);
+
+            foreach (var script in field.Scripts)
+            {
+                if (script.Activity == "ready" && script.Source.Contains("xfa.layout"))
+                {
+                    var proxy = BuildFieldProxy(field, dataCtx, text, fieldPath);
+                    _scriptEngine!.Execute(script.Source, proxy, $"{field.Name}/layout:ready");
+                }
+            }
+        }
+        else if (element is XfaSubformDef subform)
+        {
+            // Execute subform-level layout:ready scripts
+            if (subform.Scripts is not null)
+            {
+                foreach (var script in subform.Scripts)
+                {
+                    if (script.Activity == "ready" && script.Source.Contains("xfa.layout"))
+                    {
+                        string path = BuildElementPath(subform, dataCtx);
+                        var proxy = new XfaElementProxy(
+                            _scriptEngine!, path, subform.Name, null,
+                            subform.Presence ?? "visible", null, subform, null);
+                        _scriptEngine!.Execute(script.Source, proxy, $"{subform.Name}/layout:ready");
+                    }
+                }
+            }
+
+            // Recurse into children
+            var resolvedData = ResolveDataContext(subform, dataCtx) ?? dataCtx;
+            foreach (var child in subform.Children)
+            {
+                ExecuteLayoutReadyScripts(child, resolvedData);
+            }
+        }
+        else if (element is XfaSubformSetDef subformSet)
+        {
+            foreach (var child in subformSet.Children)
+            {
+                ExecuteLayoutReadyScripts(child, dataCtx);
+            }
+        }
+    }
+
     // ===================== Text Measurement =====================
 
     private static double EstimateTextHeight(string text, XfaFont font, double widthMm, XfaMargin margin)
     {
-        // Use a conservative line height factor (1.15) for single-line minimum.
-        // This ensures minH from the template controls field height for single-line text,
-        // since most XFA fields specify minH="4mm" which should be the effective height.
-        double singleLineH = font.SizePt * 0.3528 * 1.15 + margin.Top + margin.Bottom;
+        // Margins (insets) are visual padding WITHIN the field box. They do NOT increase the
+        // field height beyond minH. The text renderer applies them internally. This matches
+        // Adobe's reference output where minH controls the row height exactly.
+        double singleLineH = font.SizePt * 0.3528 * 1.15;
         if (string.IsNullOrEmpty(text)) return Math.Max(singleLineH, 3);
 
         double availW = widthMm - margin.Left - margin.Right;
@@ -1768,7 +2351,7 @@ public sealed class XfaLayoutEngine
 
         // Multi-line: use 1.2x line height factor (calibrated against Adobe reference output)
         double lineHeightMm = font.SizePt * 0.3528 * 1.2;
-        double textH = totalLines * lineHeightMm + margin.Top + margin.Bottom;
+        double textH = totalLines * lineHeightMm;
 
         return Math.Max(textH, singleLineH);
     }

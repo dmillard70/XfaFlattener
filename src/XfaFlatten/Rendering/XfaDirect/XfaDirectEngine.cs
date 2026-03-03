@@ -121,9 +121,12 @@ public sealed class XfaDirectEngine : IRenderEngine
             Console.WriteLine($"[XfaDirect] Data nodes indexed: {data.NodesByName.Count}");
         }
 
-        // Step 5: Layout
+        // Step 5: Layout with script engine
         if (verbose) Console.WriteLine("[XfaDirect] Computing layout...");
-        var layoutEngine = new XfaLayoutEngine(parseResult.PageAreas, data, verbose);
+
+        using var scriptEngine = new XfaScriptEngine(verbose);
+
+        var layoutEngine = new XfaLayoutEngine(parseResult.PageAreas, data, verbose, scriptEngine);
 
         XfaLayoutEngine.LayoutResult layoutResult;
         if (parseResult.RootSubform is not null)
