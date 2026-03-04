@@ -858,7 +858,7 @@ public sealed class XfaLayoutEngine
             List<RichTextSegment>? richSegments = null;
             if (dataNode?.RichTextHtml is not null)
             {
-                richSegments = XfaDataParser.ParseRichTextSegments(dataNode.RichTextHtml);
+                richSegments = XfaDataParser.ParseRichTextParagraphSegments(dataNode.RichTextHtml);
                 if (richSegments.Count == 0) richSegments = null;
             }
 
@@ -1040,7 +1040,12 @@ public sealed class XfaLayoutEngine
             var dataNode = ResolveFieldDataNode(field, dataCtx);
             if (dataNode?.RichTextHtml is not null)
             {
-                var segments = XfaDataParser.ParseRichTextSegments(dataNode.RichTextHtml);
+                // Paragraph-level segments for rendering: one segment per <p> element,
+                // preventing inline formatting spans from stacking as separate lines.
+                var segments = XfaDataParser.ParseRichTextParagraphSegments(dataNode.RichTextHtml);
+                // Per-span segments for height computation: the per-span count gives a
+                // more conservative (taller) height estimate that matches Adobe's layout.
+                var heightSegments = XfaDataParser.ParseRichTextSegments(dataNode.RichTextHtml);
                 // Use per-segment rendering when formatting differs, or when blank
                 // paragraphs exist (empty <p> elements produce leading/internal "\n\n").
                 // The per-segment path preserves blank lines that StripHtmlToPlainText trims.
@@ -1095,11 +1100,11 @@ public sealed class XfaLayoutEngine
 
                         segY += segH;
                     }
-                    // Compute full field height from untrimmed segment text so that
-                    // trailing blank paragraphs (empty <p> elements) still contribute to
-                    // the field's allocated space, even though the rendered text is trimmed.
+                    // Compute full field height from per-span segments (not paragraph segments).
+                    // Per-span segments give a conservative height estimate that matches Adobe's
+                    // layout spacing, while paragraph segments are used only for rendering.
                     double fullContentH = 0;
-                    foreach (var seg2 in segments)
+                    foreach (var seg2 in heightSegments)
                     {
                         double fs = seg2.FontSizePt ?? renderFont.SizePt;
                         double lh = fs * 0.3528 * 1.2;

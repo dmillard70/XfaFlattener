@@ -312,6 +312,294 @@ public sealed partial class XfaDataParser
         return segments;
     }
 
+    /// <summary>
+    /// Parses rich text HTML into ONE segment per <![CDATA[<p>]]> element, using dominant formatting.
+    /// This prevents inline formatting spans from creating separate layout items that stack vertically.
+    /// </summary>
+    internal static List<RichTextSegment> ParseRichTextParagraphSegments(string html)
+    {
+        if (string.IsNullOrEmpty(html)) return new List<RichTextSegment>();
+
+        XmlDocument doc;
+        try
+        {
+            string xmlStr = $"<root xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\">{html}</root>";
+            doc = new XmlDocument();
+            doc.LoadXml(xmlStr);
+        }
+        catch
+        {
+            // XML parse failure — fall back to per-span segments
+            return ParseRichTextSegments(html);
+        }
+
+        if (doc.DocumentElement is null) return ParseRichTextSegments(html);
+
+        // Check if there are any <p> elements; if not, fall back to existing parser
+        bool hasParagraphs = false;
+        foreach (XmlNode child in doc.DocumentElement.ChildNodes)
+        {
+            if (child.NodeType == XmlNodeType.Element && child.LocalName.Equals("p", StringComparison.OrdinalIgnoreCase))
+            {
+                hasParagraphs = true;
+                break;
+            }
+        }
+        if (!hasParagraphs) return ParseRichTextSegments(html);
+
+        var segments = new List<RichTextSegment>();
+
+        foreach (XmlNode child in doc.DocumentElement.ChildNodes)
+        {
+            if (child.NodeType != XmlNodeType.Element) continue;
+            if (!child.LocalName.Equals("p", StringComparison.OrdinalIgnoreCase)) continue;
+
+            // Collect all text within this <p> into one string
+            var sb = new StringBuilder();
+            CollectParagraphText(child, sb);
+            string paraText = sb.ToString().Trim();
+
+            if (paraText.Length == 0)
+            {
+                // Empty paragraph (xfa-spacerun spacer) — preserve as blank line
+                if (segments.Count > 0)
+                {
+                    var prev = segments[^1];
+                    segments[^1] = prev with { Text = prev.Text + "\n" };
+                }
+                else
+                {
+                    segments.Add(new RichTextSegment("\n", false, false, false));
+                }
+                continue;
+            }
+
+            // Determine dominant formatting from <p>-level style + child spans
+            var (bold, italic, underline, fontSize, fontFamily) = DetermineDominantFormatting(child);
+
+            segments.Add(new RichTextSegment(paraText, bold, italic, underline, fontSize, fontFamily));
+        }
+
+        // Consolidate consecutive segments with identical formatting
+        if (segments.Count > 1)
+        {
+            var consolidated = new List<RichTextSegment>();
+            var current = segments[0];
+            for (int i = 1; i < segments.Count; i++)
+            {
+                var next = segments[i];
+                if (next.Bold == current.Bold && next.Italic == current.Italic
+                    && next.Underline == current.Underline && next.FontSizePt == current.FontSizePt
+                    && next.FontFamily == current.FontFamily)
+                {
+                    current = current.Text.EndsWith('\n')
+                        ? current with { Text = current.Text + next.Text }
+                        : current with { Text = current.Text + "\n" + next.Text };
+                }
+                else
+                {
+                    consolidated.Add(current);
+                    current = next;
+                }
+            }
+            consolidated.Add(current);
+            segments = consolidated;
+        }
+
+        // Cap trailing blank lines to 2 (same as ParseRichTextSegments)
+        if (segments.Count > 0)
+        {
+            var last = segments[^1];
+            string text = last.Text;
+            int trailingNewlines = 0;
+            for (int i = text.Length - 1; i >= 0 && text[i] == '\n'; i--)
+                trailingNewlines++;
+            if (trailingNewlines > 2)
+            {
+                string trimmed = text[..^(trailingNewlines - 2)];
+                segments[^1] = last with { Text = trimmed };
+            }
+        }
+
+        return segments;
+    }
+
+    /// <summary>
+    /// Recursively collects all text content from a paragraph node into a single string.
+    /// Handles xfa-spacerun (→ space) and xfa-tab-count (→ tab).
+    /// </summary>
+    private static void CollectParagraphText(XmlNode node, StringBuilder sb)
+    {
+        foreach (XmlNode child in node.ChildNodes)
+        {
+            if (child.NodeType == XmlNodeType.Text)
+            {
+                string val = child.Value ?? "";
+                // Collapse internal whitespace but preserve meaningful text
+                string trimmed = val.Trim();
+                if (trimmed.Length > 0)
+                {
+                    if (sb.Length > 0 && sb[^1] != ' ' && sb[^1] != '\t')
+                        sb.Append(' ');
+                    sb.Append(trimmed);
+                }
+                continue;
+            }
+
+            if (child.NodeType != XmlNodeType.Element) continue;
+
+            // Handle xfa-spacerun and xfa-tab-count spans
+            string? style = child.Attributes?["style"]?.Value;
+            if (style is not null)
+            {
+                if (style.Contains("xfa-spacerun:yes", StringComparison.OrdinalIgnoreCase))
+                {
+                    sb.Append(' ');
+                    continue;
+                }
+                if (style.Contains("xfa-tab-count", StringComparison.OrdinalIgnoreCase))
+                {
+                    sb.Append('\t');
+                    continue;
+                }
+            }
+
+            // Recurse into child elements (b, i, span, etc.)
+            CollectParagraphText(child, sb);
+        }
+    }
+
+    /// <summary>
+    /// Determines the dominant formatting for a paragraph by examining the <![CDATA[<p>]]>-level style
+    /// and finding which child formatting covers the most characters.
+    /// </summary>
+    private static (bool Bold, bool Italic, bool Underline, double? FontSize, string? FontFamily) DetermineDominantFormatting(XmlNode pNode)
+    {
+        // Start with <p>-level style
+        bool pBold = false, pItalic = false, pUnderline = false;
+        double? pFontSize = null;
+        string? pFontFamily = null;
+
+        string? pStyle = pNode.Attributes?["style"]?.Value;
+        if (pStyle is not null)
+        {
+            if (pStyle.Contains("font-weight:bold", StringComparison.OrdinalIgnoreCase)
+                || pStyle.Contains("font-weight: bold", StringComparison.OrdinalIgnoreCase))
+                pBold = true;
+            if (pStyle.Contains("font-style:italic", StringComparison.OrdinalIgnoreCase)
+                || pStyle.Contains("font-style: italic", StringComparison.OrdinalIgnoreCase))
+                pItalic = true;
+            if (pStyle.Contains("text-decoration:underline", StringComparison.OrdinalIgnoreCase)
+                || pStyle.Contains("text-decoration: underline", StringComparison.OrdinalIgnoreCase))
+                pUnderline = true;
+
+            var fontSizeMatch = FontSizeRegex().Match(pStyle);
+            if (fontSizeMatch.Success && double.TryParse(fontSizeMatch.Groups[1].Value,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out double ps))
+                pFontSize = ps;
+
+            var fontFamilyMatch = FontFamilyRegex().Match(pStyle);
+            if (fontFamilyMatch.Success)
+                pFontFamily = fontFamilyMatch.Groups[1].Value.Trim().Trim('\'', '"');
+        }
+
+        // Walk children to find the dominant (most chars) formatting for bold/italic/fontSize
+        var runs = new List<(int CharCount, bool Bold, bool Italic, bool Underline, double? FontSize, string? FontFamily)>();
+        CollectFormattingRuns(pNode, pBold, pItalic, pUnderline, pFontSize, pFontFamily, runs);
+
+        if (runs.Count == 0)
+            return (pBold, pItalic, pUnderline, pFontSize, pFontFamily);
+
+        // Find the run covering the most characters
+        int maxChars = 0;
+        int maxIdx = 0;
+        int totalChars = 0;
+        int boldChars = 0;
+        for (int i = 0; i < runs.Count; i++)
+        {
+            totalChars += runs[i].CharCount;
+            if (runs[i].Bold) boldChars += runs[i].CharCount;
+            if (runs[i].CharCount > maxChars)
+            {
+                maxChars = runs[i].CharCount;
+                maxIdx = i;
+            }
+        }
+
+        // Bold applies if majority of chars are bold (handles fully bold paragraphs)
+        bool dominant = boldChars > totalChars / 2;
+
+        return (
+            Bold: dominant || pBold,
+            Italic: runs[maxIdx].Italic || pItalic,
+            Underline: runs[maxIdx].Underline || pUnderline,
+            FontSize: runs[maxIdx].FontSize ?? pFontSize,
+            FontFamily: runs[maxIdx].FontFamily ?? pFontFamily
+        );
+    }
+
+    /// <summary>
+    /// Collects (charCount, formatting) tuples from text runs within a node.
+    /// </summary>
+    private static void CollectFormattingRuns(XmlNode node, bool parentBold, bool parentItalic,
+        bool parentUnderline, double? parentFontSize, string? parentFontFamily,
+        List<(int CharCount, bool Bold, bool Italic, bool Underline, double? FontSize, string? FontFamily)> runs)
+    {
+        foreach (XmlNode child in node.ChildNodes)
+        {
+            if (child.NodeType == XmlNodeType.Text)
+            {
+                string text = child.Value?.Trim() ?? "";
+                if (text.Length > 0)
+                    runs.Add((text.Length, parentBold, parentItalic, parentUnderline, parentFontSize, parentFontFamily));
+                continue;
+            }
+
+            if (child.NodeType != XmlNodeType.Element) continue;
+
+            string localName = child.LocalName.ToLowerInvariant();
+            bool bold = parentBold, italic = parentItalic, underline = parentUnderline;
+            double? fontSize = parentFontSize;
+            string? fontFamily = parentFontFamily;
+
+            if (localName == "b" || localName == "strong") bold = true;
+            if (localName == "i" || localName == "em") italic = true;
+            if (localName == "u") underline = true;
+
+            string? style = child.Attributes?["style"]?.Value;
+            if (style is not null)
+            {
+                if (style.Contains("font-weight:bold", StringComparison.OrdinalIgnoreCase)
+                    || style.Contains("font-weight: bold", StringComparison.OrdinalIgnoreCase))
+                    bold = true;
+                if (style.Contains("font-style:italic", StringComparison.OrdinalIgnoreCase)
+                    || style.Contains("font-style: italic", StringComparison.OrdinalIgnoreCase))
+                    italic = true;
+                if (style.Contains("text-decoration:underline", StringComparison.OrdinalIgnoreCase)
+                    || style.Contains("text-decoration: underline", StringComparison.OrdinalIgnoreCase))
+                    underline = true;
+
+                var fontSizeMatch = FontSizeRegex().Match(style);
+                if (fontSizeMatch.Success && double.TryParse(fontSizeMatch.Groups[1].Value,
+                        System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out double fs))
+                    fontSize = fs;
+
+                var fontFamilyMatch = FontFamilyRegex().Match(style);
+                if (fontFamilyMatch.Success)
+                    fontFamily = fontFamilyMatch.Groups[1].Value.Trim().Trim('\'', '"');
+            }
+
+            // Skip xfa-spacerun / xfa-tab-count spans
+            if (style is not null && (style.Contains("xfa-spacerun", StringComparison.OrdinalIgnoreCase)
+                || style.Contains("xfa-tab-count", StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            CollectFormattingRuns(child, bold, italic, underline, fontSize, fontFamily, runs);
+        }
+    }
+
     private static void WalkForSegments(XmlNode node, bool parentBold, bool parentItalic,
         bool parentUnderline, double? parentFontSize, List<RichTextSegment> segments,
         string? parentFontFamily = null)
