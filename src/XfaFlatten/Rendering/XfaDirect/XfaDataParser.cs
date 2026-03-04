@@ -275,15 +275,23 @@ public sealed partial class XfaDataParser
             segments = consolidated;
         }
 
-        // Trim trailing blank lines from the last segment (matching StripHtmlToPlainText
-        // behavior). Trailing empty paragraphs in XFA rich text (xfa-spacerun spacers)
-        // don't produce visible output in Adobe's renderer.
+        // Trailing blank paragraphs in XFA rich text (xfa-spacerun spacers) contribute to
+        // field height. Adobe's renderer preserves some trailing blanks but not unlimited.
+        // Cap trailing blank lines to 2 to match reference behavior.
         if (segments.Count > 0)
         {
             var last = segments[^1];
-            string trimmed = last.Text.TrimEnd('\n');
-            if (trimmed.Length != last.Text.Length)
+            string text = last.Text;
+            // Count trailing newlines
+            int trailingNewlines = 0;
+            for (int i = text.Length - 1; i >= 0 && text[i] == '\n'; i--)
+                trailingNewlines++;
+            // Keep at most 2 trailing blank lines (each \n = one blank paragraph boundary)
+            if (trailingNewlines > 2)
+            {
+                string trimmed = text[..^(trailingNewlines - 2)];
                 segments[^1] = last with { Text = trimmed };
+            }
         }
 
         return segments;

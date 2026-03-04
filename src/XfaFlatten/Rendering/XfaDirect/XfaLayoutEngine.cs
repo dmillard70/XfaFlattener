@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace XfaFlatten.Rendering.XfaDirect;
 
 /// <summary>
@@ -22,6 +24,10 @@ public sealed class XfaLayoutEngine
 
     // Track script-created element proxies for parent chain navigation
     private readonly Dictionary<string, XfaElementProxy> _proxyCache = new(StringComparer.OrdinalIgnoreCase);
+
+    // Caption reserve overrides from JS scripts: "this.parent.wert.caption.reserve = this.rawValue"
+    // Key = data context path + "." + target field name, Value = reserve in mm
+    private readonly Dictionary<string, double> _captionReserveOverrides = new(StringComparer.OrdinalIgnoreCase);
 
     public XfaLayoutEngine(List<XfaPageArea> pageAreas, XfaData data, bool verbose,
         XfaScriptEngine? scriptEngine = null)
@@ -111,6 +117,7 @@ public sealed class XfaLayoutEngine
         _items.Clear();
         _elementPageMap.Clear();
         _proxyCache.Clear();
+        _captionReserveOverrides.Clear();
 
         // Start data context from the root data node
         var dataCtx = _data.Root;
@@ -127,9 +134,16 @@ public sealed class XfaLayoutEngine
     private double LayoutElement(XfaElement element, double x, ref double curY,
         double availW, double pageBottom, XfaDataNode? dataCtx)
     {
-        // Skip hidden elements
+        // Skip hidden elements — but still process caption.reserve scripts
         if (element.Presence is "hidden" or "inactive")
+        {
+            if (element is XfaFieldDef hiddenField)
+            {
+                if (hiddenField.Scripts is { Count: > 0 })
+                    ProcessCaptionReserveScripts(hiddenField, dataCtx);
+            }
             return 0;
+        }
 
         return element switch
         {
@@ -490,7 +504,12 @@ public sealed class XfaLayoutEngine
         foreach (var child in children)
         {
             if (child.Presence is "hidden" or "inactive")
+            {
+                // Still process caption.reserve scripts on hidden fields (e.g., abstand → wert)
+                if (child is XfaFieldDef hiddenField && hiddenField.Scripts is { Count: > 0 })
+                    ProcessCaptionReserveScripts(hiddenField, dataCtx);
                 continue;
+            }
 
             double childW = child.W ?? availW;
 
@@ -669,7 +688,12 @@ public sealed class XfaLayoutEngine
         }
 
         if (effectivePresence is "hidden" or "inactive")
+        {
+            // Even hidden fields may have scripts that affect siblings (e.g., caption.reserve).
+            // Process caption.reserve scripts before returning 0.
+            ProcessCaptionReserveScripts(field, dataCtx);
             return 0;
+        }
 
         // Skip invisible but still return height so layout flows correctly
         bool invisible = effectivePresence == "invisible";
@@ -706,6 +730,12 @@ public sealed class XfaLayoutEngine
         // When the resolved value is empty, treat the field as hidden (0 height).
         if (field.HideIfEmpty && string.IsNullOrEmpty(text))
             return 0;
+
+        // Caption reserve: template default for height estimation (layout), JS override for rendering.
+        // XFA form:ready scripts run AFTER layout — they modify visual properties, not layout flow.
+        double? captionReserveForLayout = field.CaptionReserve;
+        double? captionReserve = GetCaptionReserveOverride(field, dataCtx) ?? field.CaptionReserve;
+
         var (dataBold, dataItalic) = DetectRichTextFormatting(field, dataCtx);
 
         // Add spaceBefore from paragraph settings
@@ -734,8 +764,7 @@ public sealed class XfaLayoutEngine
             fieldY = curY;
         }
 
-        // Compute height: use explicit H if set, otherwise use the field's bottom margin.
-        // Invisible fields take up layout space but are not rendered (XFA spec).
+        // Compute height: invisible fields take up layout space but are not rendered (XFA spec).
         // element_leerzeile: minH=4mm, bottomInset=2mm. Using 2mm gives correct 11-page count.
         double fieldH;
         if (invisible)
@@ -746,8 +775,8 @@ public sealed class XfaLayoutEngine
         {
             // If the field has a caption reserve, the text only occupies the remaining width.
             double estimateW = fieldW;
-            if (field.CaptionReserve.HasValue && (field.CaptionText is not null || field.CaptionBindRef is not null))
-                estimateW -= field.CaptionReserve.Value;
+            if (captionReserveForLayout.HasValue && (field.CaptionText is not null || field.CaptionBindRef is not null))
+                estimateW -= captionReserveForLayout.Value;
             fieldH = field.H ?? EstimateTextHeight(text, field.Font, estimateW, field.Margin);
             fieldH = Math.Max(fieldH, field.MinH ?? 0);
         }
@@ -934,9 +963,9 @@ public sealed class XfaLayoutEngine
                 // Resolve caption text from data (setProperty target="caption.value.#text" ref="bezeichner2")
                 captionText = ResolveSimpleRef(field.CaptionBindRef, dataCtx);
             }
-            if (captionText is not null && field.CaptionReserve.HasValue)
+            if (captionText is not null && captionReserve.HasValue)
             {
-                double captionW = field.CaptionReserve.Value;
+                double captionW = captionReserve.Value;
                 _items.Add(new LayoutItem(
                     PageIndex: _currentPage,
                     X: textX, Y: textY, W: captionW, H: textH,
@@ -1043,12 +1072,14 @@ public sealed class XfaLayoutEngine
             fieldDone:;
         }
 
-        // Emit border/fill for fields. Skip background fill for empty fields
-        // with fill colors (e.g., empty h3 header bars) — Adobe doesn't render
-        // backgrounds for fields with no visible text content.
+        // Emit border/fill for fields. Skip background fill for fields with no data at all
+        // (truly empty instances). Fields with whitespace-only data (like h3 with " ") still
+        // get their fill because they're structural spacers in the reference output.
         if (!invisible)
         {
-            if (string.IsNullOrEmpty(text) && field.Border.FillColor is not null
+            var fillDataNode = ResolveFieldDataNode(field, dataCtx);
+            bool hasNoData = fillDataNode is null;
+            if (hasNoData && field.Border.FillColor is not null
                 && field.CaptionText is null)
             {
                 // Emit stroke border only, no fill
@@ -2293,6 +2324,106 @@ public sealed class XfaLayoutEngine
                 ExecuteLayoutReadyScripts(child, dataCtx);
             }
         }
+    }
+
+    // ===================== Caption Reserve Overrides =====================
+
+    /// <summary>
+    /// Regex to extract target field name from caption.reserve scripts.
+    /// Matches patterns like: this.parent.wert.caption.reserve = this.rawValue
+    /// Also matches: this.parent.wert1.caption.reserve = this.rawValue
+    /// </summary>
+    private static readonly Regex CaptionReserveRegex = new(
+        @"this\.parent\.(\w+)\.caption\.reserve\s*=\s*this\.rawValue",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// Process scripts on hidden fields that set caption.reserve on sibling fields.
+    /// Pattern: "this.parent.FIELDNAME.caption.reserve = this.rawValue"
+    /// The hidden field's data value (e.g., "25mm") is parsed and stored as an override.
+    /// </summary>
+    private void ProcessCaptionReserveScripts(XfaFieldDef field, XfaDataNode? dataCtx)
+    {
+        if (field.Scripts is null || field.Scripts.Count == 0) return;
+
+        foreach (var script in field.Scripts)
+        {
+            var match = CaptionReserveRegex.Match(script.Source);
+            if (!match.Success) continue;
+
+            string targetFieldName = match.Groups[1].Value;
+
+            // Resolve the hidden field's data value (e.g., "25mm", "35mm")
+            string rawValue = ResolveFieldValue(field, dataCtx);
+            if (string.IsNullOrEmpty(rawValue)) continue;
+
+            // Parse the mm value
+            double reserveMm = ParseMmValue(rawValue);
+            if (reserveMm <= 0) continue;
+
+            // Build a key that matches the target field in the same data context.
+            // Use the data context's object reference hash to make keys instance-specific.
+            // Different data instances of the same template (e.g., multiple zeile_zweispaltig)
+            // may have different abstand values and must not overwrite each other.
+            int ctxHash = dataCtx is not null
+                ? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(dataCtx)
+                : 0;
+            string key = $"{ctxHash}.{targetFieldName}";
+            _captionReserveOverrides[key] = reserveMm;
+        }
+    }
+
+    /// <summary>
+    /// Gets the caption reserve override for a field, if one was set by a sibling's script.
+    /// </summary>
+    private double? GetCaptionReserveOverride(XfaFieldDef field, XfaDataNode? dataCtx)
+    {
+        if (_captionReserveOverrides.Count == 0 || field.Name is null) return null;
+
+        // Use the same hash-based key as ProcessCaptionReserveScripts.
+        // The hidden abstand field and this target field share the same dataCtx
+        // (siblings in the same subform's lr-tb layout).
+        int ctxHash = dataCtx is not null
+            ? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(dataCtx)
+            : 0;
+        string key = $"{ctxHash}.{field.Name}";
+        if (_captionReserveOverrides.TryGetValue(key, out double val))
+            return val;
+
+        return null;
+    }
+
+    /// <summary>
+    /// Parses a measurement string like "25mm" into a double value in mm.
+    /// </summary>
+    private static double ParseMmValue(string value)
+    {
+        string trimmed = value.Trim();
+        if (trimmed.EndsWith("mm", StringComparison.OrdinalIgnoreCase))
+        {
+            if (double.TryParse(trimmed[..^2], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double mm))
+                return mm;
+        }
+        else if (trimmed.EndsWith("in", StringComparison.OrdinalIgnoreCase))
+        {
+            if (double.TryParse(trimmed[..^2], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double inches))
+                return inches * 25.4;
+        }
+        else if (trimmed.EndsWith("pt", StringComparison.OrdinalIgnoreCase))
+        {
+            if (double.TryParse(trimmed[..^2], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double pt))
+                return pt * 0.3528; // 1pt = 0.3528mm
+        }
+        else if (double.TryParse(trimmed, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out double plain))
+        {
+            return plain; // Assume mm if no unit
+        }
+
+        return 0;
     }
 
     // ===================== Text Measurement =====================
