@@ -106,7 +106,9 @@ public record XfaSubformDef(
     string? BreakTarget,
     string? BreakTargetType = null,
     List<XfaScript>? Scripts = null,
-    List<XfaNamedScript>? NamedScripts = null) : XfaElement(Name, X, Y, W, H, MinH, Presence);
+    List<XfaNamedScript>? NamedScripts = null,
+    bool KeepIntact = false,
+    bool KeepNext = false) : XfaElement(Name, X, Y, W, H, MinH, Presence);
 
 /// <summary>
 /// A subformSet that controls which child subform is chosen (choice/relation).
@@ -157,7 +159,11 @@ public record XfaBorder(
     bool Visible = false,
     double Thickness = 0.2,
     string? FillColor = null,
-    string? StrokeColor = null);
+    string? StrokeColor = null,
+    bool TopEdge = true,
+    bool RightEdge = true,
+    bool BottomEdge = true,
+    bool LeftEdge = true);
 
 /// <summary>
 /// Corner definition for rectangles.
@@ -253,6 +259,21 @@ public sealed class XfaDataNode
     public string? RichTextHtml { get; set; }
     public List<XfaDataNode> Children { get; } = new();
     public XfaDataNode? Parent { get; set; }
+
+    /// <summary>
+    /// XML attributes on this data node (e.g., horizontal="left", width="3").
+    /// Used by data-driven dynamic tables (oDynamicTable pattern).
+    /// </summary>
+    public Dictionary<string, string>? Attributes { get; set; }
+
+    /// <summary>
+    /// Gets an attribute value, or null if not present.
+    /// </summary>
+    public string? GetAttribute(string name)
+    {
+        if (Attributes is null) return null;
+        return Attributes.TryGetValue(name, out var val) ? val : null;
+    }
 
     /// <summary>
     /// Finds direct children with the given name.

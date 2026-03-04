@@ -211,8 +211,18 @@ public static class XfaPdfWriter
     {
         double x1 = item.X * MmToPt;
         double y1 = item.Y * MmToPt;
-        double x2 = (item.X + item.W) * MmToPt;
-        double y2 = item.Y * MmToPt; // Horizontal line
+        // Determine direction: if W >= H, horizontal line; otherwise vertical line
+        double x2, y2;
+        if (item.W >= item.H)
+        {
+            x2 = (item.X + item.W) * MmToPt;
+            y2 = y1; // Horizontal
+        }
+        else
+        {
+            x2 = x1; // Vertical
+            y2 = (item.Y + item.H) * MmToPt;
+        }
 
         var color = ParseColor(item.StrokeColor) ?? DefaultStrokeColor;
         double thickness = item.StrokeThicknessPt > 0 ? item.StrokeThicknessPt : 0.5;

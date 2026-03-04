@@ -64,6 +64,21 @@ public sealed partial class XfaDataParser
     {
         var node = new XfaDataNode(xmlNode.LocalName) { Parent = parent };
 
+        // Store XML attributes (used by data-driven dynamic tables)
+        if (xmlNode.Attributes is { Count: > 0 })
+        {
+            var attrs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (XmlAttribute attr in xmlNode.Attributes)
+            {
+                // Skip namespace declarations
+                if (attr.Name.StartsWith("xmlns", StringComparison.Ordinal)) continue;
+                if (attr.Prefix == "xfa") continue;
+                attrs[attr.LocalName] = attr.Value;
+            }
+            if (attrs.Count > 0)
+                node.Attributes = attrs;
+        }
+
         // Check if this node has rich text (XHTML body content)
         bool hasChildElements = false;
         bool hasBodyElement = false;

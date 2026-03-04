@@ -440,6 +440,20 @@ public sealed class XfaTemplateParser
         // columnWidths for table layout
         string? columnWidths = GetAttr(node, "columnWidths");
 
+        // Parse <keep> element: intact="contentArea" and/or next="contentArea"
+        bool keepIntact = false;
+        bool keepNext = false;
+        var keepNode = FindChild(node, "keep");
+        if (keepNode is not null)
+        {
+            string? intact = GetAttr(keepNode, "intact");
+            if (intact is "contentArea" or "pageArea")
+                keepIntact = true;
+            string? next = GetAttr(keepNode, "next");
+            if (next is "contentArea" or "pageArea")
+                keepNext = true;
+        }
+
         return new XfaSubformDef(
             Name: GetAttr(node, "name"),
             X: ParseMeasurement(GetAttr(node, "x")),
@@ -461,7 +475,9 @@ public sealed class XfaTemplateParser
             BreakTarget: breakTarget,
             BreakTargetType: breakTargetType,
             Scripts: scripts.Count > 0 ? scripts : null,
-            NamedScripts: namedScripts.Count > 0 ? namedScripts : null);
+            NamedScripts: namedScripts.Count > 0 ? namedScripts : null,
+            KeepIntact: keepIntact,
+            KeepNext: keepNext);
     }
 
     private XfaSubformSetDef ParseSubformSet(XmlNode node)
@@ -626,16 +642,24 @@ public sealed class XfaTemplateParser
             return new XfaBorder(Visible: false);
 
         // Parse all edge elements (XFA borders can have 1 or 4 edges: top, right, bottom, left)
+        // XFA edge order: top(0), right(1), bottom(2), left(3).
+        // If only 1 edge, it applies to all 4 sides.
         double thickness = 0.2;
         string? strokeColor = null;
         bool anyEdgeVisible = false;
+
+        // Track per-edge visibility
+        var edgeVisibility = new List<bool>();
 
         foreach (XmlNode child in borderNode.ChildNodes)
         {
             if (child.LocalName != "edge") continue;
 
             string? edgePresence = GetAttr(child, "presence");
-            if (edgePresence == "hidden") continue;
+            bool edgeVisible = edgePresence != "hidden";
+            edgeVisibility.Add(edgeVisible);
+
+            if (!edgeVisible) continue;
 
             anyEdgeVisible = true;
             double edgeThickness = ParseMeasurement(GetAttr(child, "thickness")) ?? 0.2;
@@ -657,9 +681,27 @@ public sealed class XfaTemplateParser
                 fillColor = GetAttr(colorNode, "value");
         }
 
-        // Visible controls stroke border rendering — only true when edges are explicitly visible.
-        // Fill backgrounds are rendered independently via FillColor, regardless of Visible.
-        return new XfaBorder(anyEdgeVisible, thickness, fillColor, strokeColor);
+        // Determine per-edge visibility.
+        // 1 edge element → applies to all 4 sides. 4 edges → top, right, bottom, left.
+        bool topVis, rightVis, bottomVis, leftVis;
+        if (edgeVisibility.Count == 0)
+        {
+            topVis = rightVis = bottomVis = leftVis = false;
+        }
+        else if (edgeVisibility.Count == 1)
+        {
+            topVis = rightVis = bottomVis = leftVis = edgeVisibility[0];
+        }
+        else
+        {
+            topVis = edgeVisibility.Count > 0 && edgeVisibility[0];
+            rightVis = edgeVisibility.Count > 1 && edgeVisibility[1];
+            bottomVis = edgeVisibility.Count > 2 && edgeVisibility[2];
+            leftVis = edgeVisibility.Count > 3 && edgeVisibility[3];
+        }
+
+        return new XfaBorder(anyEdgeVisible, thickness, fillColor, strokeColor,
+            topVis, rightVis, bottomVis, leftVis);
     }
 
     private static string? ParseBindRef(XmlNode node)

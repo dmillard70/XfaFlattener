@@ -216,8 +216,10 @@ public sealed class XfaLayoutEngine
 
         // Walk data children in order and instantiate matching template subforms
         int matchCount = 0, missCount = 0;
-        foreach (var dataChild in dataScope.Children)
+        var dataChildren = dataScope.Children;
+        for (int di = 0; di < dataChildren.Count; di++)
         {
+            var dataChild = dataChildren[di];
             XfaSubformDef? matchedTemplate = null;
 
             // Try to find template subform by data child name
@@ -234,6 +236,17 @@ public sealed class XfaLayoutEngine
                 // is still the relevant context — fields inside use bind ref to
                 // reference the specific data element (e.g., h2[*] matches THIS h2).
                 XfaDataNode? instanceData = dataChild;
+
+                // Section header keep-with-next: if this is a section header (h2/h1)
+                // and the next data sibling is a table section, check whether the header
+                // plus the table's first rows fit on the current page. If not, advance
+                // to the next page BEFORE rendering the header so both move together.
+                // This emulates Adobe's JS-driven keep behavior (resolveNode("break").before).
+                if (IsKeepWithNextHeader(dataChild, matchedTemplate, di, dataChildren,
+                    templateByDataName, curY, pageBottom, availW))
+                {
+                    AdvanceToNextPage(ref curY, ref pageBottom);
+                }
 
                 double h = LayoutSubformSingleInstance(matchedTemplate, x, ref curY, availW, pageBottom, instanceData);
                 totalH += h;
@@ -343,6 +356,18 @@ public sealed class XfaLayoutEngine
             double marginBottom = subform.Margin.Bottom;
             double marginLeft = subform.Margin.Left;
             double marginRight = subform.Margin.Right;
+
+            // keep intact="contentArea": if the subform doesn't fit on the current page,
+            // advance to the next page before starting layout. Estimate height from children.
+            if (subform.KeepIntact && curY + marginTop < pageBottom)
+            {
+                double estimatedH = EstimateSubformHeight(subform, subformW - marginLeft - marginRight, instanceData);
+                double remaining = pageBottom - (curY + marginTop);
+                if (estimatedH > remaining && remaining < pageBottom * 0.5)
+                {
+                    AdvanceToNextPage(ref curY, ref pageBottom);
+                }
+            }
 
             double innerX = subformX + marginLeft;
             double innerW = subformW - marginLeft - marginRight;
@@ -559,6 +584,16 @@ public sealed class XfaLayoutEngine
         // Parse column widths
         double[] colWidths = ParseColumnWidths(table.ColumnWidths, availW);
 
+        // Apply data-driven table settings (oDynamicTable pattern):
+        // Data nodes like <tabelle_4 width="170mm"> with <defaults><spalteN width="3" horizontal="left"/></defaults>
+        // define column widths and alignment that override template defaults.
+        var tableData = ResolveDataContext(table, dataCtx) ?? dataCtx;
+        var dynSettings = ReadDynamicTableSettings(tableData, colWidths.Length, availW);
+        if (dynSettings is not null)
+        {
+            colWidths = dynSettings.Value.columnWidths;
+        }
+
         foreach (var child in table.Children)
         {
             if (child is XfaSubformDef row && row.Layout == "row")
@@ -572,7 +607,8 @@ public sealed class XfaLayoutEngine
                         AdvanceToNextPage(ref curY, ref pageBottom);
                     }
 
-                    LayoutTableRow(row, x, ref curY, colWidths, pageBottom, rowData);
+                    LayoutTableRow(row, x, ref curY, colWidths, pageBottom, rowData,
+                        dynSettings?.columnAligns);
                 }
             }
             else
@@ -583,13 +619,22 @@ public sealed class XfaLayoutEngine
     }
 
     private void LayoutTableRow(XfaSubformDef row, double x, ref double curY,
-        double[] colWidths, double pageBottom, XfaDataNode? dataCtx)
+        double[] colWidths, double pageBottom, XfaDataNode? dataCtx,
+        string[]? columnAligns = null)
     {
         double rowH = 0;
         double curX = x;
         int colIdx = 0;
 
         var resolvedData = ResolveDataContext(row, dataCtx) ?? dataCtx;
+
+        // Read per-cell alignment overrides from data node attributes (oDynamicTable pattern).
+        // Cell data nodes may have horizontal="left"/"right"/"center" that override template defaults.
+        string[]? cellAligns = null;
+        if (columnAligns is not null || resolvedData is not null)
+        {
+            cellAligns = ReadCellAligns(row, resolvedData, columnAligns);
+        }
 
         // Track cell positions for border emission
         var cellPositions = new List<(double x, double w, XfaBorder border)>();
@@ -607,8 +652,16 @@ public sealed class XfaLayoutEngine
                 continue;
             }
 
+            // Apply data-driven alignment override to field
+            var layoutCell = cell;
+            if (cellAligns is not null && colIdx < cellAligns.Length && cellAligns[colIdx] is not null
+                && cell is XfaFieldDef field)
+            {
+                layoutCell = field with { Para = field.Para with { HAlign = cellAligns[colIdx] } };
+            }
+
             // Get cell border info
-            XfaBorder cellBorder = cell switch
+            XfaBorder cellBorder = layoutCell switch
             {
                 XfaFieldDef f => f.Border,
                 XfaSubformDef s => s.Border,
@@ -619,7 +672,7 @@ public sealed class XfaLayoutEngine
             double tempY = curY;
             // In table rows, the column width overrides the field's W attribute
             // (fields often have placeholder widths from the template designer)
-            double cellH = LayoutTableCell(cell, curX, ref tempY, cellW, pageBottom, resolvedData);
+            double cellH = LayoutTableCell(layoutCell, curX, ref tempY, cellW, pageBottom, resolvedData);
             double usedH = cellH > 0 ? cellH : (cell.H ?? cell.MinH ?? 4);
             rowH = Math.Max(rowH, usedH);
 
@@ -629,7 +682,7 @@ public sealed class XfaLayoutEngine
 
         double finalRowH = Math.Max(rowH, row.H ?? row.MinH ?? 4);
 
-        // Emit borders for table cells using the final row height
+        // Emit borders for table cells using the final row height.
         foreach (var (cellX, cellW, cellBorder) in cellPositions)
         {
             EmitBorder(cellBorder, cellX, curY, cellW, finalRowH);
@@ -765,11 +818,11 @@ public sealed class XfaLayoutEngine
         }
 
         // Compute height: invisible fields take up layout space but are not rendered (XFA spec).
-        // element_leerzeile: minH=4mm, bottomInset=2mm. Using 2mm gives correct 11-page count.
+        // element_leerzeile: minH=4mm, bottomInset=2mm. Per XFA spec, use minH for layout height.
         double fieldH;
         if (invisible)
         {
-            fieldH = field.H ?? field.Margin.Bottom;
+            fieldH = field.H ?? field.MinH ?? field.Margin.Bottom;
         }
         else
         {
@@ -2021,18 +2074,61 @@ public sealed class XfaLayoutEngine
         // Emit stroked border
         if (border.Visible && border.Thickness > 0)
         {
-            // Convert thickness from mm to pt for the layout item
             double thicknessPt = border.Thickness * (72.0 / 25.4);
-            _items.Add(new LayoutItem(
-                PageIndex: _currentPage,
-                X: x, Y: y, W: w, H: h,
-                Text: "",
-                Font: new XfaFont(),
-                Para: new XfaPara(),
-                ItemType: LayoutItemType.Rectangle,
-                StrokeColor: border.StrokeColor,
-                StrokeThicknessPt: thicknessPt));
+            bool allEdges = border.TopEdge && border.RightEdge && border.BottomEdge && border.LeftEdge;
+
+            if (allEdges)
+            {
+                // All 4 edges visible — draw full rectangle
+                _items.Add(new LayoutItem(
+                    PageIndex: _currentPage,
+                    X: x, Y: y, W: w, H: h,
+                    Text: "",
+                    Font: new XfaFont(),
+                    Para: new XfaPara(),
+                    ItemType: LayoutItemType.Rectangle,
+                    StrokeColor: border.StrokeColor,
+                    StrokeThicknessPt: thicknessPt));
+            }
+            else
+            {
+                // Partial border — draw individual edge lines
+                if (border.TopEdge)
+                    EmitLine(x, y, w, thicknessPt, border.StrokeColor);
+                if (border.BottomEdge)
+                    EmitLine(x, y + h, w, thicknessPt, border.StrokeColor);
+                if (border.LeftEdge)
+                    EmitVLine(x, y, h, thicknessPt, border.StrokeColor);
+                if (border.RightEdge)
+                    EmitVLine(x + w, y, h, thicknessPt, border.StrokeColor);
+            }
         }
+    }
+
+    private void EmitLine(double x, double y, double w, double thicknessPt, string? strokeColor)
+    {
+        _items.Add(new LayoutItem(
+            PageIndex: _currentPage,
+            X: x, Y: y, W: w, H: 0.2,
+            Text: "",
+            Font: new XfaFont(),
+            Para: new XfaPara(),
+            ItemType: LayoutItemType.Line,
+            StrokeColor: strokeColor,
+            StrokeThicknessPt: thicknessPt));
+    }
+
+    private void EmitVLine(double x, double y, double h, double thicknessPt, string? strokeColor)
+    {
+        _items.Add(new LayoutItem(
+            PageIndex: _currentPage,
+            X: x, Y: y, W: 0.2, H: h,
+            Text: "",
+            Font: new XfaFont(),
+            Para: new XfaPara(),
+            ItemType: LayoutItemType.Line,
+            StrokeColor: strokeColor,
+            StrokeThicknessPt: thicknessPt));
     }
 
     // ===================== Script Execution Helpers =====================
@@ -2480,8 +2576,9 @@ public sealed class XfaLayoutEngine
             }
         }
 
-        // Multi-line: use 1.2x line height factor (calibrated against Adobe reference output)
-        double lineHeightMm = font.SizePt * 0.3528 * 1.2;
+        // Multi-line: use 1.15x line height factor (calibrated against Adobe reference output;
+        // reduced from 1.2 to compensate for corrected invisible field height minH).
+        double lineHeightMm = font.SizePt * 0.3528 * 1.15;
         double textH = totalLines * lineHeightMm;
 
         return Math.Max(textH, singleLineH);
@@ -2529,4 +2626,241 @@ public sealed class XfaLayoutEngine
 
         return widths;
     }
+
+    // ===================== Data-Driven Dynamic Table (oDynamicTable) =====================
+
+    /// <summary>
+    /// Estimates the total height of a subform for keep-intact page break decisions.
+    /// Uses a rough estimate based on child elements and data instances.
+    /// </summary>
+    /// <summary>
+    /// Determines whether a section header (h2/h1) should keep with its next sibling.
+    /// In XFA forms, section headers like "Umschuldung/Ablösung" (h2) are always
+    /// followed by their content (a table section). Adobe's JS engine uses
+    /// resolveNode("break").before = "pageArea" to keep these together.
+    /// This implements the same behavior natively: if a header is near the page bottom
+    /// and the next sibling is a table section that won't fit, return true to trigger
+    /// a page advance before the header.
+    /// </summary>
+    private bool IsKeepWithNextHeader(XfaDataNode dataChild, XfaSubformDef template,
+        int currentIndex, List<XfaDataNode> dataChildren,
+        Dictionary<string, XfaSubformDef> templateByDataName,
+        double curY, double pageBottom, double availW)
+    {
+        // Only apply to section headers (h1, h2)
+        string name = template.Name ?? "";
+        if (name is not ("h1" or "h2"))
+            return false;
+
+        // Look ahead to find the next matched sibling
+        XfaSubformDef? nextTemplate = null;
+        XfaDataNode? nextDataChild = null;
+        for (int j = currentIndex + 1; j < dataChildren.Count; j++)
+        {
+            if (templateByDataName.TryGetValue(dataChildren[j].Name, out var next))
+            {
+                nextTemplate = next;
+                nextDataChild = dataChildren[j];
+                break;
+            }
+        }
+
+        if (nextTemplate is null)
+            return false;
+
+        // Only trigger for table-containing sections (absatz_tabelle_*)
+        bool nextHasTable = false;
+        foreach (var child in nextTemplate.Children)
+        {
+            if (child is XfaSubformDef sub && sub.Layout == "table")
+            {
+                nextHasTable = true;
+                break;
+            }
+        }
+        if (!nextHasTable)
+            return false;
+
+        // Estimate: header height + space for at least the table kopfzeile + one data row.
+        // After the header is placed, the table section needs at least ~12mm for a meaningful
+        // start (kopfzeile ≈ 6mm + one data row ≈ 6mm). If there's not enough room for
+        // the header + that minimum, move both to the next page together.
+        double headerH = EstimateSubformHeight(template, availW, dataChild);
+        double minTableStart = 10; // kopfzeile minimum space to avoid orphan header
+        double remaining = pageBottom - curY;
+
+        // Only trigger when the table would start with less than one row of space
+        // after the header. This avoids being too aggressive when there's moderate
+        // room (e.g., 17mm remaining — enough for header + kopfzeile before natural overflow).
+        double spaceAfterHeader = remaining - headerH;
+        if (spaceAfterHeader < minTableStart)
+            return true;
+
+        return false;
+    }
+
+    private double EstimateSubformHeight(XfaSubformDef subform, double availW, XfaDataNode? dataCtx)
+    {
+        double totalH = 0;
+        foreach (var child in subform.Children)
+        {
+            switch (child)
+            {
+                case XfaFieldDef field:
+                    double fieldH = field.H ?? field.MinH ?? 5;
+                    totalH += fieldH;
+                    break;
+                case XfaDrawDef draw:
+                    totalH += draw.H ?? draw.MinH ?? 4;
+                    break;
+                case XfaSubformDef sub:
+                    if (sub.Layout == "table")
+                    {
+                        // Estimate table height: header + data rows
+                        int rowCount = 1; // at least header
+                        var tableData = ResolveDataContext(sub, dataCtx) ?? dataCtx;
+                        foreach (var tableChild in sub.Children)
+                        {
+                            if (tableChild is XfaSubformDef row && row.Layout == "row")
+                            {
+                                var rowInstances = GetDataInstances(row, tableData);
+                                rowCount += rowInstances.Count;
+                            }
+                        }
+                        totalH += rowCount * 6; // ~6mm per row
+                    }
+                    else
+                    {
+                        totalH += sub.H ?? sub.MinH ?? 5;
+                        // Recurse for tb-layout children
+                        if (sub.Layout == "tb" && sub.Children.Count > 0)
+                        {
+                            totalH += EstimateSubformHeight(sub, availW, dataCtx);
+                        }
+                    }
+                    break;
+            }
+        }
+        return totalH + subform.Margin.Top + subform.Margin.Bottom;
+    }
+
+    /// <summary>
+    /// Reads data-driven table settings from the data node (oDynamicTable pattern).
+    /// XFA forms use a JavaScript library (oDynamicTable.applySettings) that reads
+    /// column widths, alignment, and border settings from data attributes.
+    /// This implements the same logic natively in C#.
+    /// </summary>
+    private static (double[] columnWidths, string[] columnAligns)?
+        ReadDynamicTableSettings(XfaDataNode? dataCtx, int templateColumnCount, double availW)
+    {
+        if (dataCtx is null) return null;
+
+        // Look for a "defaults" child node with "spalteN" children defining column settings
+        var defaults = dataCtx.Children.FirstOrDefault(
+            c => string.Equals(c.Name, "defaults", StringComparison.OrdinalIgnoreCase));
+        if (defaults is null) return null;
+
+        // Read width attribute from table data node to determine unit
+        string? tableWidthStr = dataCtx.GetAttribute("width");
+        double tableWidth = availW;
+        if (tableWidthStr is not null)
+        {
+            double? parsed = XfaTemplateParser.ParseMeasurement(tableWidthStr);
+            if (parsed.HasValue && parsed.Value > 0)
+                tableWidth = parsed.Value;
+        }
+
+        // Parse spalteN definitions from defaults
+        var colDefs = new SortedDictionary<int, (double width, string hAlign)>();
+        foreach (var child in defaults.Children)
+        {
+            // Extract column index from name like "spalte1", "spalte2", etc.
+            if (!child.Name.StartsWith("spalte", StringComparison.OrdinalIgnoreCase)) continue;
+            string idxStr = child.Name.Substring(6);
+            if (!int.TryParse(idxStr, out int colNum) || colNum < 1) continue;
+            int colIdx = colNum - 1;
+
+            double width = 10; // default
+            string? widthStr = child.GetAttribute("width");
+            if (widthStr is not null && double.TryParse(widthStr,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out double w))
+                width = w;
+
+            string hAlign = child.GetAttribute("horizontal") ?? "left";
+            colDefs[colIdx] = (width, hAlign);
+        }
+
+        if (colDefs.Count == 0) return null;
+
+        int numCols = Math.Max(colDefs.Keys.Max() + 1, templateColumnCount);
+
+        // Compute proportional column widths (data widths are relative/percentage-like)
+        double totalRelative = colDefs.Values.Sum(d => d.width);
+        double[] colWidths = new double[numCols];
+        string[] colAligns = new string[numCols];
+        for (int i = 0; i < numCols; i++)
+        {
+            if (colDefs.TryGetValue(i, out var def))
+            {
+                colWidths[i] = totalRelative > 0 ? (def.width / totalRelative) * tableWidth : tableWidth / numCols;
+                colAligns[i] = def.hAlign;
+            }
+            else
+            {
+                colWidths[i] = tableWidth / numCols;
+                colAligns[i] = "left";
+            }
+        }
+
+        return (colWidths, colAligns);
+    }
+
+    /// <summary>
+    /// Reads per-cell alignment overrides from the row's data node.
+    /// Each cell data node may have a "horizontal" attribute that overrides the column default.
+    /// </summary>
+    private static string[]? ReadCellAligns(XfaSubformDef row, XfaDataNode? rowData,
+        string[]? columnAligns)
+    {
+        if (columnAligns is null && rowData is null) return null;
+
+        int numCols = row.Children.Count;
+        var aligns = new string[numCols];
+
+        // Start with column defaults
+        for (int i = 0; i < numCols; i++)
+            aligns[i] = columnAligns is not null && i < columnAligns.Length ? columnAligns[i] : "left";
+
+        // Override with per-cell data attributes
+        if (rowData is not null)
+        {
+            int cellIdx = 0;
+            foreach (var child in row.Children)
+            {
+                if (cellIdx >= numCols) break;
+                string? cellName = child.Name;
+                if (cellName is not null)
+                {
+                    // Find matching data node for this cell
+                    var cellData = rowData.Children.FirstOrDefault(
+                        c => string.Equals(c.Name, cellName, StringComparison.OrdinalIgnoreCase));
+                    if (cellData is not null)
+                    {
+                        string? hAlign = cellData.GetAttribute("horizontal");
+                        if (hAlign is not null)
+                            aligns[cellIdx] = hAlign;
+                    }
+                }
+                cellIdx++;
+            }
+        }
+
+        return aligns;
+    }
+
+    /// <summary>
+    /// Removes layout items on the given page that were emitted after (or at) the given Y position.
+    /// Used for orphan prevention when a table header needs to be moved to the next page.
+    /// </summary>
 }
