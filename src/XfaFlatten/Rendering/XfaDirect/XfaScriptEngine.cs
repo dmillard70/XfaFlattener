@@ -24,6 +24,9 @@ public sealed class XfaScriptEngine : IDisposable
     // Track script-modified presence: elementPath -> presence string
     private readonly Dictionary<string, string> _modifiedPresence = new(StringComparer.OrdinalIgnoreCase);
 
+    // Data tree reference for resolveNode() support
+    private XfaData? _data;
+
     public XfaScriptEngine(bool verbose = false)
     {
         _verbose = verbose;
@@ -79,15 +82,12 @@ public sealed class XfaScriptEngine : IDisposable
     {
         try
         {
-            // Set up the xfa global object
+            // Set up the xfa global object with resolveNode, layout, host, and data proxies
             var xfaLayout = new XfaLayoutProxy(this);
             var xfaHost = new XfaHostProxy(_verbose);
+            var xfaGlobal = new XfaGlobalProxy(this, _data, xfaLayout, xfaHost);
 
-            _engine.SetValue("xfa", new
-            {
-                layout = xfaLayout,
-                host = xfaHost
-            });
+            _engine.SetValue("xfa", xfaGlobal);
 
             // Bind 'this' via a wrapper: Jint doesn't let us override 'this' directly,
             // so we use a with/call pattern: wrap the script as a function and call it.
@@ -128,6 +128,117 @@ public sealed class XfaScriptEngine : IDisposable
         // Replace 'this.' with 'self.' for property access
         // This handles: this.rawValue, this.presence, this.isNull, this.parent, etc.
         return script.Replace("this.", "self.");
+    }
+
+    /// <summary>
+    /// Set the XFA data tree for resolveNode() support in scripts.
+    /// </summary>
+    public void SetData(XfaData data)
+    {
+        _data = data;
+    }
+
+    /// <summary>
+    /// Resolve a SOM (Scripting Object Model) expression to a data node.
+    /// Supports patterns: "name1.name2[N].name3", "xfa.form..name" (descendant search),
+    /// and "xfa.data.path.to.node".
+    /// </summary>
+    internal XfaElementProxy? ResolveNode(string somExpression)
+    {
+        if (_data is null || string.IsNullOrEmpty(somExpression)) return null;
+
+        string expr = somExpression;
+
+        // Strip leading "xfa.form.." or "xfa.data." prefixes
+        if (expr.StartsWith("xfa.form..", StringComparison.OrdinalIgnoreCase))
+        {
+            // Double-dot means "search all descendants"
+            expr = expr["xfa.form..".Length..];
+            return ResolveByDescendantSearch(expr);
+        }
+        if (expr.StartsWith("xfa.data.", StringComparison.OrdinalIgnoreCase))
+        {
+            expr = expr["xfa.data.".Length..];
+            // Navigate from data root
+            var node = NavigateSomPath(_data.Root, expr);
+            return node is not null ? CreateDataProxy(node) : null;
+        }
+
+        // Try as relative path: navigate from data root's first child (main data element)
+        var dataRoot = _data.Root.Children.Count > 0 ? _data.Root.Children[0] : _data.Root;
+        var resolved = NavigateSomPath(dataRoot, expr);
+        if (resolved is not null) return CreateDataProxy(resolved);
+
+        // Fallback: search all nodes by the leaf name
+        return ResolveByDescendantSearch(expr);
+    }
+
+    private XfaElementProxy? ResolveByDescendantSearch(string expr)
+    {
+        if (_data is null) return null;
+
+        // For descendant search, navigate as much of the path as possible
+        // then search by the remaining name
+        var parts = expr.Split('.');
+        string leafName = parts[^1];
+        // Strip array index from leaf
+        int bracketIdx = leafName.IndexOf('[');
+        int arrayIndex = 0;
+        if (bracketIdx >= 0)
+        {
+            string indexStr = leafName[(bracketIdx + 1)..].TrimEnd(']');
+            int.TryParse(indexStr, out arrayIndex);
+            leafName = leafName[..bracketIdx];
+        }
+
+        // Search by name in the index
+        if (_data.NodesByName.TryGetValue(leafName, out var nodes) && nodes.Count > arrayIndex)
+        {
+            return CreateDataProxy(nodes[arrayIndex]);
+        }
+        return null;
+    }
+
+    internal static XfaDataNode? NavigateSomPath(XfaDataNode start, string path)
+    {
+        var parts = path.Split('.');
+        XfaDataNode? current = start;
+
+        foreach (var part in parts)
+        {
+            if (current is null) return null;
+
+            string nodeName = part;
+            int arrayIndex = 0;
+
+            // Handle array notation: name[N]
+            int bracketIdx = part.IndexOf('[');
+            if (bracketIdx >= 0)
+            {
+                string indexStr = part[(bracketIdx + 1)..].TrimEnd(']');
+                int.TryParse(indexStr, out arrayIndex);
+                nodeName = part[..bracketIdx];
+            }
+
+            var children = current.GetChildren(nodeName);
+            current = arrayIndex < children.Count ? children[arrayIndex] : null;
+        }
+
+        return current;
+    }
+
+    internal XfaElementProxy CreateDataProxy(XfaDataNode node)
+    {
+        var proxy = new XfaElementProxy(this, $"data.{node.Name}", node.Name,
+            node.TextValue, "visible", node, null, null);
+        // Add child proxies for direct children (shallow)
+        foreach (var child in node.Children)
+        {
+            var childProxy = new XfaElementProxy(this, $"data.{node.Name}.{child.Name}",
+                child.Name, child.TextValue, "visible", child, null, proxy);
+            proxy.AddChild(child.Name, childProxy);
+        }
+        return proxy;
     }
 
     /// <summary>
@@ -310,6 +421,26 @@ public sealed class XfaElementProxy
     public XfaCaptionProxy? caption { get; set; }
 
     /// <summary>
+    /// Resolves a SOM expression relative to this element or globally via the engine.
+    /// Used by scripts like: this.resolveNode("break"), xfa.resolveNode("path.to.field")
+    /// </summary>
+    public XfaElementProxy? resolveNode(string somExpression)
+    {
+        if (string.IsNullOrEmpty(somExpression)) return null;
+
+        // Try relative resolution from current data node first
+        if (_dataNode is not null && !somExpression.StartsWith("xfa.", StringComparison.OrdinalIgnoreCase))
+        {
+            var resolved = XfaScriptEngine.NavigateSomPath(_dataNode, somExpression);
+            if (resolved is not null)
+                return _engine.CreateDataProxy(resolved);
+        }
+
+        // Fall back to global resolution
+        return _engine.ResolveNode(somExpression);
+    }
+
+    /// <summary>
     /// For numeric comparisons in scripts (e.g., this.rawValue != 1).
     /// </summary>
     public override string? ToString() => _rawValue;
@@ -373,6 +504,41 @@ public sealed class XfaLayoutProxy
     public int pageCount(object? ignored)
     {
         return _engine.TotalPages;
+    }
+}
+
+/// <summary>
+/// Global proxy for the 'xfa' object, providing resolveNode(), layout, host, data, and template access.
+/// </summary>
+public sealed class XfaGlobalProxy
+{
+    private readonly XfaScriptEngine _engine;
+    private readonly XfaData? _data;
+
+    public XfaGlobalProxy(XfaScriptEngine engine, XfaData? data,
+        XfaLayoutProxy layout, XfaHostProxy host)
+    {
+        _engine = engine;
+        _data = data;
+        this.layout = layout;
+        this.host = host;
+
+        // Set up xfa.data proxy for data path navigation
+        if (data?.Root.Children.Count > 0)
+            this.data = engine.CreateDataProxy(data.Root.Children[0]);
+    }
+
+    public XfaLayoutProxy layout { get; }
+    public XfaHostProxy host { get; }
+    public XfaElementProxy? data { get; }
+
+    /// <summary>
+    /// Resolves a SOM expression globally.
+    /// Used by scripts like: xfa.resolveNode("xfa.form..field.rawValue")
+    /// </summary>
+    public XfaElementProxy? resolveNode(string somExpression)
+    {
+        return _engine.ResolveNode(somExpression);
     }
 }
 

@@ -219,6 +219,7 @@ public sealed class XfaTemplateParser
 
         // Caption
         double? captionReserve = null;
+        string? captionPlacement = null;
         string? captionText = null;
         XfaFont? captionFont = null;
         XfaPara? captionPara = null;
@@ -226,6 +227,7 @@ public sealed class XfaTemplateParser
         if (captionNode is not null)
         {
             captionReserve = ParseMeasurement(GetAttr(captionNode, "reserve"));
+            captionPlacement = GetAttr(captionNode, "placement");
             var captionValueNode = FindChild(captionNode, "value");
             if (captionValueNode is not null)
             {
@@ -293,6 +295,7 @@ public sealed class XfaTemplateParser
             IsRichText: isRichText,
             IsMultiLine: isMultiLine,
             CaptionReserve: captionReserve,
+            CaptionPlacement: captionPlacement,
             CaptionText: captionText,
             CaptionFont: captionFont,
             CaptionPara: captionPara,
@@ -300,7 +303,10 @@ public sealed class XfaTemplateParser
             Border: border,
             CaptionBindRef: captionBindRef,
             HideIfEmpty: hideIfEmpty,
-            Scripts: scripts.Count > 0 ? scripts : null);
+            Scripts: scripts.Count > 0 ? scripts : null,
+            MaxH: ParseMeasurement(GetAttr(node, "maxH")),
+            ColSpan: ParseColSpan(GetAttr(node, "colSpan")),
+            AnchorType: GetAttr(node, "anchorType"));
     }
 
     private XfaDrawDef ParseDraw(XmlNode node)
@@ -381,7 +387,9 @@ public sealed class XfaTemplateParser
             IsLine: isLine,
             IsRectangle: isRectangle,
             Border: border,
-            Corner: corner);
+            Corner: corner,
+            ColSpan: ParseColSpan(GetAttr(node, "colSpan")),
+            AnchorType: GetAttr(node, "anchorType"));
     }
 
     private XfaSubformDef ParseSubform(XmlNode node)
@@ -392,7 +400,8 @@ public sealed class XfaTemplateParser
             if (child.NodeType != XmlNodeType.Element) continue;
             if (child.LocalName is "bind" or "occur" or "keep" or "breakBefore"
                 or "breakAfter" or "break" or "border" or "margin" or "event"
-                or "calculate" or "validate" or "variables" or "proto" or "assist") continue;
+                or "calculate" or "validate" or "variables" or "proto" or "assist"
+                or "overflow") continue;
 
             var element = ParseElement(child);
             if (element is not null)
@@ -424,6 +433,22 @@ public sealed class XfaTemplateParser
             breakTargetType = GetAttr(breakBeforeNode, "targetType");
         }
 
+        // Parse breakAfter (new-style): only trigger when targetType or startNew is specified
+        bool hasBreakAfter = false;
+        string? breakAfterTarget = null;
+        string? breakAfterTargetType = null;
+        var breakAfterNode = FindChild(node, "breakAfter");
+        if (breakAfterNode is not null)
+        {
+            breakAfterTargetType = GetAttr(breakAfterNode, "targetType");
+            string? startNew = GetAttr(breakAfterNode, "startNew");
+            if (breakAfterTargetType is not null || startNew == "1")
+            {
+                hasBreakAfter = true;
+                breakAfterTarget = GetAttr(breakAfterNode, "target");
+            }
+        }
+
         // Old-style <break> element: <break before="pageArea" beforeTarget="DS_V1_SET0"/>
         var breakNode = FindChild(node, "break");
         if (breakNode is not null && !hasBreakBefore)
@@ -434,6 +459,17 @@ public sealed class XfaTemplateParser
                 hasBreakBefore = true;
                 breakTarget = GetAttr(breakNode, "beforeTarget");
                 breakTargetType = beforeType;
+            }
+        }
+        // Old-style <break> also supports after: <break after="pageArea" afterTarget="..."/>
+        if (breakNode is not null && !hasBreakAfter)
+        {
+            string? afterType = GetAttr(breakNode, "after");
+            if (afterType is "pageArea" or "contentArea")
+            {
+                hasBreakAfter = true;
+                breakAfterTarget = GetAttr(breakNode, "afterTarget");
+                breakAfterTargetType = afterType;
             }
         }
 
@@ -453,6 +489,19 @@ public sealed class XfaTemplateParser
             if (next is "contentArea" or "pageArea")
                 keepNext = true;
         }
+
+        // Parse <overflow leader="..." trailer="..."> for repeating header/footer on page overflow
+        string? overflowLeader = null;
+        string? overflowTrailer = null;
+        var overflowNode = FindChild(node, "overflow");
+        if (overflowNode is not null)
+        {
+            overflowLeader = GetAttr(overflowNode, "leader");
+            overflowTrailer = GetAttr(overflowNode, "trailer");
+        }
+
+        // Parse maxH constraint
+        double? maxH = ParseMeasurement(GetAttr(node, "maxH"));
 
         return new XfaSubformDef(
             Name: GetAttr(node, "name"),
@@ -477,7 +526,15 @@ public sealed class XfaTemplateParser
             Scripts: scripts.Count > 0 ? scripts : null,
             NamedScripts: namedScripts.Count > 0 ? namedScripts : null,
             KeepIntact: keepIntact,
-            KeepNext: keepNext);
+            KeepNext: keepNext,
+            OverflowLeader: overflowLeader,
+            MaxH: maxH,
+            OverflowTrailer: overflowTrailer,
+            ColSpan: ParseColSpan(GetAttr(node, "colSpan")),
+            HasBreakAfter: hasBreakAfter,
+            BreakAfterTarget: breakAfterTarget,
+            BreakAfterTargetType: breakAfterTargetType,
+            AnchorType: GetAttr(node, "anchorType"));
     }
 
     private XfaSubformSetDef ParseSubformSet(XmlNode node)
@@ -613,8 +670,8 @@ public sealed class XfaTemplateParser
             HAlign: GetAttr(paraNode, "hAlign") ?? "left",
             VAlign: GetAttr(paraNode, "vAlign") ?? "top",
             LineHeight: ParsePtValue(GetAttr(paraNode, "lineHeight")),
-            SpaceBefore: ParseMeasurement(GetAttr(paraNode, "spaceBefore")),
-            SpaceAfter: ParseMeasurement(GetAttr(paraNode, "spaceAfter")));
+            SpaceBefore: ParseMeasurement(GetAttr(paraNode, "spaceAbove")),
+            SpaceAfter: ParseMeasurement(GetAttr(paraNode, "spaceBelow")));
     }
 
     internal static XfaMargin ParseMarginElement(XmlNode parentNode)
@@ -644,7 +701,9 @@ public sealed class XfaTemplateParser
         // Parse all edge elements (XFA borders can have 1 or 4 edges: top, right, bottom, left)
         // XFA edge order: top(0), right(1), bottom(2), left(3).
         // If only 1 edge, it applies to all 4 sides.
-        double thickness = 0.2;
+        // Per XFA 3.3 ref-template-spec: edge thickness defaults to 0.5pt (~0.176mm).
+        const double defaultEdgeThickness = 0.5 * 25.4 / 72.0; // 0.5pt in mm
+        double thickness = defaultEdgeThickness;
         string? strokeColor = null;
         bool anyEdgeVisible = false;
 
@@ -655,14 +714,16 @@ public sealed class XfaTemplateParser
         {
             if (child.LocalName != "edge") continue;
 
+            // Per XFA 3.3 ref-template-spec: presence can be visible, hidden, inactive, invisible.
+            // Only "visible" (or default/absent) means the edge is rendered.
             string? edgePresence = GetAttr(child, "presence");
-            bool edgeVisible = edgePresence != "hidden";
+            bool edgeVisible = edgePresence is null or "visible";
             edgeVisibility.Add(edgeVisible);
 
             if (!edgeVisible) continue;
 
             anyEdgeVisible = true;
-            double edgeThickness = ParseMeasurement(GetAttr(child, "thickness")) ?? 0.2;
+            double edgeThickness = ParseMeasurement(GetAttr(child, "thickness")) ?? defaultEdgeThickness;
             if (edgeThickness > thickness || strokeColor is null)
                 thickness = edgeThickness;
 
@@ -694,14 +755,20 @@ public sealed class XfaTemplateParser
         }
         else
         {
-            topVis = edgeVisibility.Count > 0 && edgeVisibility[0];
-            rightVis = edgeVisibility.Count > 1 && edgeVisibility[1];
-            bottomVis = edgeVisibility.Count > 2 && edgeVisibility[2];
-            leftVis = edgeVisibility.Count > 3 && edgeVisibility[3];
+            // Per XFA 3.3 spec p.38: "If fewer than four edge or corner elements are
+            // supplied, the last element is reused for the remaining edges."
+            bool lastVis = edgeVisibility[^1];
+            topVis = edgeVisibility.Count > 0 ? edgeVisibility[0] : lastVis;
+            rightVis = edgeVisibility.Count > 1 ? edgeVisibility[1] : lastVis;
+            bottomVis = edgeVisibility.Count > 2 ? edgeVisibility[2] : lastVis;
+            leftVis = edgeVisibility.Count > 3 ? edgeVisibility[3] : lastVis;
         }
 
+        // Parse border break mode: "close" (default) or "open" (XFA 3.3 Ch.8 p.294)
+        string borderBreak = GetAttr(borderNode, "break") ?? "close";
+
         return new XfaBorder(anyEdgeVisible, thickness, fillColor, strokeColor,
-            topVis, rightVis, bottomVis, leftVis);
+            topVis, rightVis, bottomVis, leftVis, borderBreak);
     }
 
     private static string? ParseBindRef(XmlNode node)
@@ -818,7 +885,20 @@ public sealed class XfaTemplateParser
     }
 
     /// <summary>
-    /// Parses a point-value string (e.g., "13pt", "8.5pt") returning the value in points.
+    /// Parses a colSpan attribute. Returns 1 if absent, -1 for "all remaining columns",
+    /// or the positive integer value. Per XFA 3.3 Ch.8 p.330: must not be zero.
+    /// </summary>
+    private static int ParseColSpan(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return 1;
+        if (int.TryParse(value, out int span))
+            return span == 0 ? 1 : span; // 0 is forbidden per spec, treat as 1
+        return 1;
+    }
+
+    /// <summary>
+    /// Parses a point-value string (e.g., "13pt", "8.5pt", "1in", "10mm") returning the value in points.
+    /// Per XFA 3.3 spec, font size attribute accepts any measurement unit.
     /// </summary>
     internal static double? ParsePtValue(string? value)
     {
@@ -829,8 +909,24 @@ public sealed class XfaTemplateParser
             if (double.TryParse(value[..^2], NumberStyles.Float, CultureInfo.InvariantCulture, out double pt))
                 return pt;
         }
+        else if (value.EndsWith("in", StringComparison.OrdinalIgnoreCase))
+        {
+            if (double.TryParse(value[..^2], NumberStyles.Float, CultureInfo.InvariantCulture, out double inches))
+                return inches * 72.0;
+        }
+        else if (value.EndsWith("mm", StringComparison.OrdinalIgnoreCase))
+        {
+            if (double.TryParse(value[..^2], NumberStyles.Float, CultureInfo.InvariantCulture, out double mm))
+                return mm * 72.0 / 25.4;
+        }
+        else if (value.EndsWith("cm", StringComparison.OrdinalIgnoreCase))
+        {
+            if (double.TryParse(value[..^2], NumberStyles.Float, CultureInfo.InvariantCulture, out double cm))
+                return cm * 10.0 * 72.0 / 25.4;
+        }
         else
         {
+            // Bare number — default to pt for font sizes
             if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double pt))
                 return pt;
         }

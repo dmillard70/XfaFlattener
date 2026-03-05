@@ -30,7 +30,8 @@ public abstract record XfaElement(
     double? W,
     double? H,
     double? MinH,
-    string? Presence);
+    string? Presence,
+    int ColSpan = 1);
 
 /// <summary>
 /// A data-bound field or static text field from the template.
@@ -52,6 +53,7 @@ public record XfaFieldDef(
     bool IsRichText,
     bool IsMultiLine,
     double? CaptionReserve,
+    string? CaptionPlacement,
     string? CaptionText,
     XfaFont? CaptionFont,
     XfaPara? CaptionPara,
@@ -59,7 +61,10 @@ public record XfaFieldDef(
     XfaBorder Border = default!,
     string? CaptionBindRef = null,
     bool HideIfEmpty = false,
-    List<XfaScript>? Scripts = null) : XfaElement(Name, X, Y, W, H, MinH, Presence);
+    List<XfaScript>? Scripts = null,
+    double? MaxH = null,
+    int ColSpan = 1,
+    string? AnchorType = null) : XfaElement(Name, X, Y, W, H, MinH, Presence, ColSpan);
 
 /// <summary>
 /// A static draw element (text, line, rectangle) from the template.
@@ -80,7 +85,9 @@ public record XfaDrawDef(
     bool IsLine,
     bool IsRectangle,
     XfaBorder Border,
-    XfaCorner? Corner) : XfaElement(Name, X, Y, W, H, MinH, Presence);
+    XfaCorner? Corner,
+    int ColSpan = 1,
+    string? AnchorType = null) : XfaElement(Name, X, Y, W, H, MinH, Presence, ColSpan);
 
 /// <summary>
 /// A subform container that holds child elements with a specific layout.
@@ -108,7 +115,15 @@ public record XfaSubformDef(
     List<XfaScript>? Scripts = null,
     List<XfaNamedScript>? NamedScripts = null,
     bool KeepIntact = false,
-    bool KeepNext = false) : XfaElement(Name, X, Y, W, H, MinH, Presence);
+    bool KeepNext = false,
+    string? OverflowLeader = null,
+    double? MaxH = null,
+    string? OverflowTrailer = null,
+    int ColSpan = 1,
+    bool HasBreakAfter = false,
+    string? BreakAfterTarget = null,
+    string? BreakAfterTargetType = null,
+    string? AnchorType = null) : XfaElement(Name, X, Y, W, H, MinH, Presence, ColSpan);
 
 /// <summary>
 /// A subformSet that controls which child subform is chosen (choice/relation).
@@ -116,7 +131,7 @@ public record XfaSubformDef(
 public record XfaSubformSetDef(
     string? Name,
     string Relation,
-    List<XfaElement> Children) : XfaElement(Name, null, null, null, null, null, null);
+    List<XfaElement> Children) : XfaElement(Name, null, null, null, null, null, null, 1);
 
 /// <summary>
 /// Font specification for text rendering.
@@ -155,6 +170,8 @@ public record XfaMargin(
 /// <summary>
 /// Border definition for elements.
 /// </summary>
+/// <param name="Break">Border break mode: "close" (default) draws borders around each fragment;
+/// "open" draws top border only on first fragment, bottom border only on last fragment.</param>
 public record XfaBorder(
     bool Visible = false,
     double Thickness = 0.2,
@@ -163,7 +180,8 @@ public record XfaBorder(
     bool TopEdge = true,
     bool RightEdge = true,
     bool BottomEdge = true,
-    bool LeftEdge = true);
+    bool LeftEdge = true,
+    string Break = "close");
 
 /// <summary>
 /// Corner definition for rectangles.
@@ -191,6 +209,12 @@ public record XfaNamedScript(string Name, string Source);
 // ===================== Layout Output Models =====================
 
 /// <summary>
+/// A single inline text run with its own font. Used for mixed-font rich text rendering
+/// where multiple runs flow sequentially on the same line within a paragraph.
+/// </summary>
+public record TextRun(string Text, XfaFont Font);
+
+/// <summary>
 /// A positioned item ready for rendering on a specific page.
 /// </summary>
 public record LayoutItem(
@@ -206,7 +230,10 @@ public record LayoutItem(
     double Rotate = 0,
     string? StrokeColor = null,
     double StrokeThicknessPt = 0,
-    string? FillColor = null);
+    string? FillColor = null,
+    List<TextRun>? Runs = null,
+    double MarginLeftMm = 0,
+    double TextIndentMm = 0);
 
 /// <summary>
 /// Types of layout items for rendering.
@@ -229,6 +256,18 @@ public enum LayoutItemType
 /// <param name="FontSizePt">Font size in points, or null to use the field's default.</param>
 /// <param name="FontFamily">Font family name from CSS, or null to use the field's default.</param>
 public record RichTextSegment(string Text, bool Bold, bool Italic, bool Underline, double? FontSizePt = null, string? FontFamily = null);
+
+/// <summary>
+/// A rich text paragraph containing inline runs with individual formatting.
+/// Produced by <see cref="XfaDataParser.ParseRichTextRuns"/> for XFA spec-compliant
+/// inline rendering where multiple spans flow on the same line within a &lt;p&gt;.
+/// </summary>
+internal record RichTextParagraph(
+    List<RichTextSegment> Runs,
+    double? MarginTopPt = null,
+    double? MarginBottomPt = null,
+    double? MarginLeftPt = null,
+    double? TextIndentPt = null);
 
 // ===================== Data Models =====================
 

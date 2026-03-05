@@ -83,6 +83,13 @@ public static class XfaPdfWriter
 
     private static void DrawText(XGraphics gfx, LayoutItem item)
     {
+        // Use inline-run rendering when the item has multiple TextRuns with individual fonts
+        if (item.Runs is { Count: > 0 })
+        {
+            DrawInlineRuns(gfx, item, new XSolidBrush(DefaultTextColor));
+            return;
+        }
+
         if (string.IsNullOrWhiteSpace(item.Text)) return;
 
         var font = CreateFont(item.Font);
@@ -110,11 +117,17 @@ public static class XfaPdfWriter
         }
 
         var textRect = new XRect(x, y, w, h);
+
+        // Clip text rendering to the LayoutItem boundary so text never extends
+        // beyond the field, preventing visual overlaps with adjacent items.
+        var clipState = gfx.Save();
+        gfx.IntersectClip(textRect);
         DrawTextInRect(gfx, item.Text, font, brush, textRect, item.Para);
 
-        // Draw underline after text (on top)
+        // Draw underline after text (on top), still inside clip
         if (item.Font.Underline)
             DrawUnderline(gfx, item.Text, font, textRect, item.Para);
+        gfx.Restore(clipState);
     }
 
     private static void DrawTextInRect(XGraphics gfx, string text, XFont font,
@@ -128,17 +141,9 @@ public static class XfaPdfWriter
         {
             try
             {
-                // Ensure rect height is tall enough for wrapped text so XTextFormatter
-                // doesn't clip trailing lines. Estimate lines from measured width,
-                // adding 1 extra line to account for word-wrapping overhead (words can't
-                // be split, so real line count is often higher than width-based estimate).
-                double linesNeeded = Math.Ceiling(measuredWidth / Math.Max(rect.Width, 1)) + 1;
-                if (text.Contains('\n'))
-                    linesNeeded = Math.Max(linesNeeded, text.Split('\n').Length + 1);
-                double neededHeight = linesNeeded * font.Height;
-                var drawRect = neededHeight > rect.Height
-                    ? new XRect(rect.X, rect.Y, rect.Width, neededHeight)
-                    : rect;
+                // Use the specified rect height. XTextFormatter will clip text that
+                // doesn't fit, which is correct for overflow/clamped fields.
+                var drawRect = rect;
 
                 var tf = new XTextFormatter(gfx);
                 tf.Alignment = para.HAlign switch
@@ -205,6 +210,111 @@ public static class XfaPdfWriter
 
         var pen = new XPen(DefaultTextColor, lineThickness);
         gfx.DrawLine(pen, startX, underlineY, startX + textWidth, underlineY);
+    }
+
+    /// <summary>
+    /// Renders inline text runs with mixed fonts/styles on the same line.
+    /// Each run is drawn sequentially, advancing X. Words wrap to the next line when
+    /// they exceed the available width. Line height is the max font height on that line.
+    /// </summary>
+    private static void DrawInlineRuns(XGraphics gfx, LayoutItem item, XSolidBrush brush)
+    {
+        double x = item.X * MmToPt;
+        double y = item.Y * MmToPt;
+        double w = item.W * MmToPt;
+        double h = item.H * MmToPt;
+
+        if (w <= 0 || h <= 0) return;
+
+        // CSS paragraph indentation:
+        // margin-left: offset for ALL lines from the left edge
+        // text-indent: additional offset for the FIRST line only (can be negative for hanging indent)
+        double marginLeftPt = item.MarginLeftMm * MmToPt;
+        double textIndentPt = item.TextIndentMm * MmToPt;
+        double leftEdge = x + marginLeftPt;         // left edge for subsequent lines
+        double firstLineLeft = leftEdge + textIndentPt; // left edge for first line
+
+        // Clip inline-run rendering to the LayoutItem boundary so text never
+        // extends beyond the field, preventing visual overlaps with adjacent items.
+        var clipState = gfx.Save();
+        gfx.IntersectClip(new XRect(x, y, w, h));
+
+        double curX = firstLineLeft;
+        double curY = y;
+        double maxLineH = 0;
+        double rightEdge = x + w;
+        var topLeft = new XStringFormat
+        {
+            Alignment = XStringAlignment.Near,
+            LineAlignment = XLineAlignment.Near
+        };
+
+        // needsSpace tracks whether the next word should be preceded by a space.
+        // It's set when we encounter inter-word boundaries (spaces from text splits
+        // or explicit space spans like xfa-spacerun).
+        bool needsSpace = false;
+
+        foreach (var run in item.Runs!)
+        {
+            string text = run.Text?.Replace('\t', ' ') ?? "";
+            if (text.Length == 0) continue;
+
+            var font = CreateFont(run.Font);
+            double lineH = font.Height * 1.15;
+            double spaceW = gfx.MeasureString(" ", font).Width;
+
+            // Detect leading space (inter-element spacing from HTML whitespace)
+            if (text.Length > 0 && text[0] == ' ')
+                needsSpace = true;
+
+            string trimmed = text.Trim();
+            if (trimmed.Length == 0)
+            {
+                // Pure whitespace run — just set needsSpace
+                needsSpace = true;
+                continue;
+            }
+
+            var words = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var word in words)
+            {
+                double wordW = gfx.MeasureString(word, font).Width;
+                double totalW = wordW + (needsSpace ? spaceW : 0);
+
+                // Word wrap: if this word doesn't fit and we're past the line start
+                if (curX + totalW > rightEdge + 0.5 && curX > x + 0.5)
+                {
+                    curY += maxLineH > 0 ? maxLineH : lineH;
+                    curX = leftEdge; // subsequent lines use margin-left (no text-indent)
+                    maxLineH = 0;
+                    needsSpace = false;
+                }
+
+                if (needsSpace)
+                    curX += spaceW;
+
+                gfx.DrawString(word, font, brush, new XPoint(curX, curY), topLeft);
+
+                // Draw per-word underline if the run is underlined
+                if (run.Font.Underline)
+                {
+                    double ulY = curY + font.Size * 1.1;
+                    double ulThick = Math.Max(0.5, font.Size * 0.05);
+                    gfx.DrawLine(new XPen(DefaultTextColor, ulThick),
+                        curX, ulY, curX + wordW, ulY);
+                }
+
+                curX += wordW;
+                maxLineH = Math.Max(maxLineH, lineH);
+                needsSpace = true; // space before next word within or across runs
+            }
+
+            // Detect trailing space (inter-element spacing)
+            if (text.Length > 0 && text[^1] == ' ')
+                needsSpace = true;
+        }
+
+        gfx.Restore(clipState);
     }
 
     private static void DrawLine(XGraphics gfx, LayoutItem item)
