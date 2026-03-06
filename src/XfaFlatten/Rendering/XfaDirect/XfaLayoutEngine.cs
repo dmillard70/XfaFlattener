@@ -53,6 +53,11 @@ public sealed class XfaLayoutEngine
     // start at the raw content area top.
     private double _continuationTopMargin = 0;
 
+    // Number of content-flow items emitted during PerformLayoutPass.
+    // Used to distinguish content items (which need X adjustment on page breaks)
+    // from page-area static items (which have their own absolute coordinates).
+    private int _contentItemCount;
+
     public XfaLayoutEngine(List<XfaPageArea> pageAreas, XfaData data, bool verbose,
         XfaScriptEngine? scriptEngine = null)
     {
@@ -130,6 +135,12 @@ public sealed class XfaLayoutEngine
         // Post-process: inject page numbers where possible
         InjectPageNumbers();
 
+        // Post-process: adjust content item X positions for pages with different content areas.
+        // During layout, x is passed by value from the initial page's content area. When content
+        // overflows to pages with different content areas (e.g., DS_V1_SET0 x=21mm → DS_V2_SET0 x=16mm),
+        // the X positions of items on those pages need correction.
+        AdjustContentAreaXForPageBreaks();
+
         return new LayoutResult(_items, _totalPages, new List<int>(_pageToAreaMap));
     }
 
@@ -159,6 +170,7 @@ public sealed class XfaLayoutEngine
         LayoutSubform(rootSubform, ca.X, ref curY, ca.W, ca.Y + ca.H, dataCtx);
 
         _totalPages = _currentPage + 1;
+        _contentItemCount = _items.Count;
     }
 
     private double LayoutElement(XfaElement element, double x, ref double curY,
@@ -2117,6 +2129,38 @@ public sealed class XfaLayoutEngine
 
         // If already V2 or no naming convention match, stay on current
         return currentIdx;
+    }
+
+    /// <summary>
+    /// Post-processing: adjusts X positions of content-flow items when different pages
+    /// use different content areas. During layout, the X base is set from page 0's content area
+    /// and passed by value through the tree. When content overflows to pages with a different
+    /// content area X, the items on those pages need their X shifted accordingly.
+    /// Only adjusts items emitted during PerformLayoutPass (content items), not page-area statics.
+    /// </summary>
+    private void AdjustContentAreaXForPageBreaks()
+    {
+        if (_pageToAreaMap.Count <= 1 || _pageAreas.Count <= 1 || _contentItemCount == 0)
+            return;
+
+        double initialCaX = _pageAreas[_pageToAreaMap[0]].ContentArea.X;
+
+        for (int i = 0; i < _contentItemCount && i < _items.Count; i++)
+        {
+            var item = _items[i];
+            int areaIdx = item.PageIndex < _pageToAreaMap.Count
+                ? _pageToAreaMap[item.PageIndex]
+                : _pageToAreaMap[^1];
+            if (areaIdx < 0 || areaIdx >= _pageAreas.Count)
+                continue;
+
+            double pageCaX = _pageAreas[areaIdx].ContentArea.X;
+            double shift = pageCaX - initialCaX;
+            if (Math.Abs(shift) > 0.001)
+            {
+                _items[i] = item with { X = item.X + shift };
+            }
+        }
     }
 
     /// <summary>
