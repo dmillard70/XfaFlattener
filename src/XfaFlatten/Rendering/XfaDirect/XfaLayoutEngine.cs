@@ -1233,13 +1233,14 @@ public sealed class XfaLayoutEngine
                             singleLineRuns = fmtLines[i].Runs;
                     }
 
+                    double subLineH = subFontSizePt * 0.3528 * 1.2;
+                    double subH = subRendered * subLineH;
+                    // Clamp to page boundary to prevent visual overlaps
+                    if (subY + subH > pageBottom)
+                        subH = Math.Max(pageBottom - subY, 0);
+
                     if (subChunk.Length > 0)
                     {
-                        double subLineH = subFontSizePt * 0.3528 * 1.2;
-                        double subH = subRendered * subLineH;
-                        // Clamp to page boundary to prevent visual overlaps
-                        if (subY + subH > pageBottom)
-                            subH = Math.Max(pageBottom - subY, 0);
                         var subFont = field.Font with
                         {
                             Typeface = curFontFamily ?? field.Font.Typeface,
@@ -1259,8 +1260,10 @@ public sealed class XfaLayoutEngine
                                 Rotate: field.Rotate,
                                 Runs: singleLineRuns));
                         }
-                        subY += subH;
                     }
+                    // Advance subY for both content and blank paragraphs —
+                    // blank paragraphs don't emit a LayoutItem but still occupy space.
+                    subY += subH;
                     subStart = subEnd;
                 }
                 lineOffset += sourceLinesUsed;
