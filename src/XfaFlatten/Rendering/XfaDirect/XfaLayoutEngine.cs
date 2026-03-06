@@ -1051,13 +1051,24 @@ public sealed class XfaLayoutEngine
             fieldY = curY;
         }
 
-        // Compute height: invisible fields take up layout space but are not rendered (XFA spec).
-        // In XFA, minH specifies the total field box height (including margins/border).
-        // element_leerzeile: minH=4mm (total height including bottomInset=2mm).
+        // Compute height: invisible/hidden fields take up layout space but are not rendered.
+        // Per XFA 3.3 spec, invisible fields occupy the same space as if visible.
+        // Height is derived from font metrics + margins (single-line), clamped to minH/maxH.
         double fieldH;
         if (invisible)
         {
-            fieldH = field.H ?? field.MinH ?? field.Margin.Bottom;
+            if (field.H.HasValue)
+            {
+                fieldH = field.H.Value;
+            }
+            else
+            {
+                double fontHeightMm = field.Font.SizePt * 0.3528;
+                double singleLineH = fontHeightMm + field.Margin.Top + field.Margin.Bottom;
+                fieldH = Math.Max(singleLineH, field.MinH ?? 0);
+            }
+            if (field.MaxH.HasValue && fieldH > field.MaxH.Value)
+                fieldH = field.MaxH.Value;
         }
         else
         {
