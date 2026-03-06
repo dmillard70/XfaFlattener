@@ -233,25 +233,22 @@ public static class XfaPdfWriter
         double textIndentPt = item.TextIndentMm * MmToPt;
         double leftEdge = x + marginLeftPt;         // left edge for subsequent lines
         double firstLineLeft = leftEdge + textIndentPt; // left edge for first line
+        double rightEdge = x + w;
+        double availWidth = rightEdge - leftEdge;
 
         // Clip inline-run rendering to the LayoutItem boundary so text never
         // extends beyond the field, preventing visual overlaps with adjacent items.
         var clipState = gfx.Save();
         gfx.IntersectClip(new XRect(x, y, w, h));
 
-        double curX = firstLineLeft;
-        double curY = y;
-        double maxLineH = 0;
-        double rightEdge = x + w;
         var topLeft = new XStringFormat
         {
             Alignment = XStringAlignment.Near,
             LineAlignment = XLineAlignment.Near
         };
 
-        // needsSpace tracks whether the next word should be preceded by a space.
-        // It's set when we encounter inter-word boundaries (spaces from text splits
-        // or explicit space spans like xfa-spacerun).
+        // Pass 1: collect words into logical lines for alignment measurement
+        var wordEntries = new List<(string word, XFont font, XfaFont xfaFont, double wordW, double spaceW, double lineH)>();
         bool needsSpace = false;
 
         foreach (var run in item.Runs!)
@@ -263,40 +260,81 @@ public static class XfaPdfWriter
             double lineH = font.Height * 1.15;
             double spaceW = gfx.MeasureString(" ", font).Width;
 
-            // Detect leading space (inter-element spacing from HTML whitespace)
-            if (text.Length > 0 && text[0] == ' ')
+            if (text[0] == ' ')
                 needsSpace = true;
 
             string trimmed = text.Trim();
-            if (trimmed.Length == 0)
-            {
-                // Pure whitespace run — just set needsSpace
-                needsSpace = true;
-                continue;
-            }
+            if (trimmed.Length == 0) { needsSpace = true; continue; }
 
             var words = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             foreach (var word in words)
             {
                 double wordW = gfx.MeasureString(word, font).Width;
-                double totalW = wordW + (needsSpace ? spaceW : 0);
+                wordEntries.Add((word, font, run.Font, wordW, needsSpace ? spaceW : 0, lineH));
+                needsSpace = true;
+            }
 
-                // Word wrap: if this word doesn't fit and we're past the line start
-                if (curX + totalW > rightEdge + 0.5 && curX > x + 0.5)
-                {
-                    curY += maxLineH > 0 ? maxLineH : lineH;
-                    curX = leftEdge; // subsequent lines use margin-left (no text-indent)
-                    maxLineH = 0;
-                    needsSpace = false;
-                }
+            if (text[^1] == ' ')
+                needsSpace = true;
+        }
 
-                if (needsSpace)
-                    curX += spaceW;
+        // Pass 2: break words into lines
+        string hAlign = item.Para.HAlign ?? "left";
+        bool needsAlign = hAlign is "right" or "center";
+
+        var lines = new List<(int start, int count, double width, double height)>();
+        double curLineW = 0;
+        double curLineH = 0;
+        int lineStart = 0;
+        bool isFirstLine = true;
+
+        for (int i = 0; i < wordEntries.Count; i++)
+        {
+            var (_, _, _, wordW, spW, lineH) = wordEntries[i];
+            double totalW = wordW + spW;
+            double lineEdge = isFirstLine ? (rightEdge - firstLineLeft) : availWidth;
+
+            if (curLineW + totalW > lineEdge + 0.5 && curLineW > 0.5)
+            {
+                lines.Add((lineStart, i - lineStart, curLineW, curLineH));
+                lineStart = i;
+                curLineW = wordW; // no leading space on new line
+                curLineH = lineH;
+                isFirstLine = false;
+                // Remove leading space for this word since it starts a new line
+                wordEntries[i] = (wordEntries[i].word, wordEntries[i].font, wordEntries[i].xfaFont,
+                    wordW, 0, lineH);
+            }
+            else
+            {
+                curLineW += totalW;
+                curLineH = Math.Max(curLineH, lineH);
+            }
+        }
+        if (lineStart < wordEntries.Count)
+            lines.Add((lineStart, wordEntries.Count - lineStart, curLineW, curLineH));
+
+        // Pass 3: draw lines with alignment
+        double curY = y;
+        isFirstLine = true;
+        foreach (var (start, count, lineWidth, lineHeight) in lines)
+        {
+            double lineLeft = isFirstLine ? firstLineLeft : leftEdge;
+            double curX = hAlign switch
+            {
+                "right" => rightEdge - lineWidth,
+                "center" => lineLeft + ((isFirstLine ? rightEdge - firstLineLeft : availWidth) - lineWidth) / 2,
+                _ => lineLeft
+            };
+
+            for (int i = start; i < start + count; i++)
+            {
+                var (word, font, xfaFont, wordW, spW, _) = wordEntries[i];
+                curX += spW;
 
                 gfx.DrawString(word, font, brush, new XPoint(curX, curY), topLeft);
 
-                // Draw per-word underline if the run is underlined
-                if (run.Font.Underline)
+                if (xfaFont.Underline)
                 {
                     double ulY = curY + font.Size * 1.1;
                     double ulThick = Math.Max(0.5, font.Size * 0.05);
@@ -305,13 +343,10 @@ public static class XfaPdfWriter
                 }
 
                 curX += wordW;
-                maxLineH = Math.Max(maxLineH, lineH);
-                needsSpace = true; // space before next word within or across runs
             }
 
-            // Detect trailing space (inter-element spacing)
-            if (text.Length > 0 && text[^1] == ' ')
-                needsSpace = true;
+            curY += lineHeight > 0 ? lineHeight : 10;
+            isFirstLine = false;
         }
 
         gfx.Restore(clipState);

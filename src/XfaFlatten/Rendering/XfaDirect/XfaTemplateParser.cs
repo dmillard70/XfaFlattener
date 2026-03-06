@@ -500,8 +500,9 @@ public sealed class XfaTemplateParser
             overflowTrailer = GetAttr(overflowNode, "trailer");
         }
 
-        // Parse maxH constraint
+        // Parse maxH constraint (XFA 3.0+: maxH=0 is equivalent to omitting it)
         double? maxH = ParseMeasurement(GetAttr(node, "maxH"));
+        if (maxH is 0) maxH = null;
 
         return new XfaSubformDef(
             Name: GetAttr(node, "name"),

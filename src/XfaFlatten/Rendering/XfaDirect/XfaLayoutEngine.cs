@@ -3030,7 +3030,10 @@ public sealed class XfaLayoutEngine
         // For minH-controlled fields, Math.Max(fieldH, minH) in the caller ensures
         // single-line fields still use the minH box height.
         double verticalMargins = margin.Top + margin.Bottom;
-        double singleLineH = font.SizePt * 0.3528 * 1.15 + verticalMargins;
+        // Single-line height uses 1.0x factor (just font em size) — no inter-line spacing
+        // needed for a single line. This allows minH to correctly dominate for single-line
+        // fields (e.g., kopfdaten: minH=4mm, font=9pt, bottomInset=0.5mm).
+        double singleLineH = font.SizePt * 0.3528 + verticalMargins;
         if (string.IsNullOrEmpty(text)) return Math.Max(singleLineH, 3);
 
         double availW = widthMm - margin.Left - margin.Right;
@@ -3077,10 +3080,20 @@ public sealed class XfaLayoutEngine
             }
         }
 
-        // Multi-line: use 1.15x line height factor (calibrated against Adobe reference output;
-        // reduced from 1.2 to compensate for corrected invisible field height minH).
-        double lineHeightMm = font.SizePt * 0.3528 * 1.15;
-        double textH = totalLines * lineHeightMm + verticalMargins;
+        // For single-line text, use 1.0x font height (no inter-line spacing needed).
+        // For multi-line text, use 1.15x line height factor (calibrated against Adobe reference;
+        // includes inter-line spacing/leading).
+        double fontHeightMm = font.SizePt * 0.3528;
+        double textH;
+        if (totalLines <= 1)
+        {
+            textH = fontHeightMm + verticalMargins;
+        }
+        else
+        {
+            double lineHeightMm = fontHeightMm * 1.15;
+            textH = totalLines * lineHeightMm + verticalMargins;
+        }
 
         return Math.Max(textH, singleLineH);
     }
@@ -3339,7 +3352,7 @@ public sealed class XfaLayoutEngine
             else
             {
                 colWidths[i] = tableWidth / numCols;
-                colAligns[i] = "left";
+                colAligns[i] = null!; // no data-driven alignment — preserve template hAlign
             }
         }
 
@@ -3358,9 +3371,10 @@ public sealed class XfaLayoutEngine
         int numCols = row.Children.Count;
         var aligns = new string[numCols];
 
-        // Start with column defaults
+        // Start with column defaults from oDynamicTable settings.
+        // Use null for columns without explicit alignment so we don't override template hAlign.
         for (int i = 0; i < numCols; i++)
-            aligns[i] = columnAligns is not null && i < columnAligns.Length ? columnAligns[i] : "left";
+            aligns[i] = columnAligns is not null && i < columnAligns.Length ? columnAligns[i] : null!;
 
         // Override with per-cell data attributes
         if (rowData is not null)
