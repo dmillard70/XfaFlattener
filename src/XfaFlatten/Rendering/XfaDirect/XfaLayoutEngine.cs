@@ -1058,7 +1058,7 @@ public sealed class XfaLayoutEngine
                 && (field.CaptionText is not null || field.CaptionBindRef is not null);
             if (hasCaptionReserve && captionPlacement is "left" or "right" or "inline")
                 estimateW -= captionReserveForLayout!.Value;
-            fieldH = field.H ?? EstimateTextHeight(text, field.Font, estimateW, field.Margin);
+            fieldH = field.H ?? EstimateTextHeight(text, field.Font, estimateW, field.Margin, field.Para.LineHeight);
             // For top/bottom captions, add the caption reserve to the total height
             if (hasCaptionReserve && captionPlacement is "top" or "bottom" && !field.H.HasValue)
                 fieldH += captionReserveForLayout!.Value;
@@ -1088,7 +1088,9 @@ public sealed class XfaLayoutEngine
         {
             double textX = fieldX + field.Margin.Left;
             double textW = fieldW - field.Margin.Left - field.Margin.Right;
-            double lineHeightMm = field.Font.SizePt * 0.3528 * 1.2;
+            double calcLineH = field.Font.SizePt * 0.3528 * 1.2;
+            double paraLineH = field.Para.LineHeight.HasValue ? field.Para.LineHeight.Value * 0.3528 : 0;
+            double lineHeightMm = Math.Max(calcLineH, paraLineH);
 
             // Build fmtLines from rich text paragraphs or plain text
             var dataNode = ResolveFieldDataNode(field, dataCtx);
@@ -1531,7 +1533,7 @@ public sealed class XfaLayoutEngine
         double drawY = curY;
         double drawW = draw.W ?? availW;
         double drawH = draw.H ?? draw.MinH ?? (draw.TextValue is not null
-            ? EstimateTextHeight(draw.TextValue, draw.Font, drawW, draw.Margin)
+            ? EstimateTextHeight(draw.TextValue, draw.Font, drawW, draw.Margin, draw.Para.LineHeight)
             : 0);
 
         if (draw.IsLine)
@@ -3022,7 +3024,8 @@ public sealed class XfaLayoutEngine
 
     // ===================== Text Measurement =====================
 
-    private static double EstimateTextHeight(string text, XfaFont font, double widthMm, XfaMargin margin)
+    private static double EstimateTextHeight(string text, XfaFont font, double widthMm,
+        XfaMargin margin, double? paraLineHeightPt = null)
     {
         // Returns the total field box height (text content + vertical margins).
         // The caller subtracts margins to get the text drawing area, so we must include
@@ -3033,7 +3036,10 @@ public sealed class XfaLayoutEngine
         // Single-line height uses 1.0x factor (just font em size) — no inter-line spacing
         // needed for a single line. This allows minH to correctly dominate for single-line
         // fields (e.g., kopfdaten: minH=4mm, font=9pt, bottomInset=0.5mm).
-        double singleLineH = font.SizePt * 0.3528 + verticalMargins;
+        // Per XFA 3.3 Ch.3: lineHeight on <para> sets minimum line height.
+        double fontHeightMm = font.SizePt * 0.3528;
+        double paraLineHeightMm = paraLineHeightPt.HasValue ? paraLineHeightPt.Value * 0.3528 : 0;
+        double singleLineH = Math.Max(fontHeightMm, paraLineHeightMm) + verticalMargins;
         if (string.IsNullOrEmpty(text)) return Math.Max(singleLineH, 3);
 
         double availW = widthMm - margin.Left - margin.Right;
@@ -3083,15 +3089,16 @@ public sealed class XfaLayoutEngine
         // For single-line text, use 1.0x font height (no inter-line spacing needed).
         // For multi-line text, use 1.15x line height factor (calibrated against Adobe reference;
         // includes inter-line spacing/leading).
-        double fontHeightMm = font.SizePt * 0.3528;
+        // Per XFA 3.3 Ch.3: use the greater of calculated line height and para.lineHeight.
         double textH;
         if (totalLines <= 1)
         {
-            textH = fontHeightMm + verticalMargins;
+            textH = Math.Max(fontHeightMm, paraLineHeightMm) + verticalMargins;
         }
         else
         {
-            double lineHeightMm = fontHeightMm * 1.15;
+            double calcLineH = fontHeightMm * 1.15;
+            double lineHeightMm = Math.Max(calcLineH, paraLineHeightMm);
             textH = totalLines * lineHeightMm + verticalMargins;
         }
 
