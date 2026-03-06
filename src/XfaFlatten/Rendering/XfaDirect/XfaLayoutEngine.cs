@@ -1081,7 +1081,79 @@ public sealed class XfaLayoutEngine
                 && (field.CaptionText is not null || field.CaptionBindRef is not null);
             if (hasCaptionReserve && captionPlacement is "left" or "right" or "inline")
                 estimateW -= captionReserveForLayout!.Value;
-            fieldH = field.H ?? EstimateTextHeight(text, field.Font, estimateW, field.Margin, field.Para.LineHeight);
+            // For rich text fields, compute height from per-paragraph structure instead of plain text.
+            // ParseRichTextRuns preserves paragraph boundaries, CSS margins (margin-left, text-indent),
+            // and per-paragraph font sizes. This avoids underestimation from:
+            // - consolidation losing paragraph structure (ParseRichTextSegments merges same-format paragraphs)
+            // - wrong char width factor (SparkasseRg=0.55 vs Arial=0.48)
+            // - ignoring hanging indent (margin-left:18pt reduces available width for continuation lines)
+            double? richTextH = null;
+            var estimateDataNode = ResolveFieldDataNode(field, dataCtx);
+            if (estimateDataNode?.RichTextHtml is not null && !field.H.HasValue)
+            {
+                var richParas = XfaDataParser.ParseRichTextRuns(estimateDataNode.RichTextHtml);
+                if (richParas.Count > 0)
+                {
+                    double rtH = field.Margin.Top + field.Margin.Bottom;
+                    double baseW = estimateW - field.Margin.Left - field.Margin.Right;
+                    if (baseW <= 0) baseW = estimateW;
+                    foreach (var para in richParas)
+                    {
+                        // Include CSS paragraph margins
+                        rtH += (para.MarginTopPt ?? 0) * 0.3528;
+                        rtH += (para.MarginBottomPt ?? 0) * 0.3528;
+
+                        // Determine paragraph font from first run (or field default)
+                        double paraFontPt = para.Runs.Count > 0 && para.Runs[0].FontSizePt is { } pfs
+                            ? pfs : field.Font.SizePt;
+                        string? paraFontFamily = para.Runs.Count > 0 ? para.Runs[0].FontFamily : null;
+
+                        // Blank paragraph (spacer)
+                        bool isEmpty = para.Runs.Count == 0
+                            || (para.Runs.Count == 1 && string.IsNullOrEmpty(para.Runs[0].Text));
+                        if (isEmpty)
+                        {
+                            rtH += paraFontPt * 0.3528 * 1.15;
+                            continue;
+                        }
+
+                        // Char width estimation (0.48 calibrated for Arial; works well for most fonts)
+                        double paraCharW = paraFontPt * 0.3528 * 0.48;
+                        if (para.Runs.Any(r => r.Bold)) paraCharW *= 1.08;
+
+                        // Account for paragraph margin-left reducing available width
+                        double paraW = baseW;
+                        if (para.MarginLeftPt.HasValue)
+                            paraW -= para.MarginLeftPt.Value * 0.3528;
+                        if (paraW <= 0) paraW = baseW;
+
+                        // Combine all run texts for this paragraph
+                        string paraText = string.Join("", para.Runs.Select(r => r.Text));
+
+                        // Word-wrap estimation
+                        int lines = 0;
+                        foreach (var hardLine in paraText.Split('\n'))
+                        {
+                            if (hardLine.Length == 0) { lines++; continue; }
+                            var words = hardLine.Split(' ');
+                            int lineCount = 1;
+                            double lineW = 0;
+                            foreach (var word in words)
+                            {
+                                double wordW = word.Length * paraCharW;
+                                if (lineW > 0 && lineW + paraCharW + wordW > paraW)
+                                { lineCount++; lineW = wordW; }
+                                else
+                                { lineW += (lineW > 0 ? paraCharW : 0) + wordW; }
+                            }
+                            lines += lineCount;
+                        }
+                        rtH += lines * paraFontPt * 0.3528 * 1.15;
+                    }
+                    richTextH = rtH;
+                }
+            }
+            fieldH = field.H ?? richTextH ?? EstimateTextHeight(text, field.Font, estimateW, field.Margin, field.Para.LineHeight);
             // For top/bottom captions, add the caption reserve to the total height
             if (hasCaptionReserve && captionPlacement is "top" or "bottom" && !field.H.HasValue)
                 fieldH += captionReserveForLayout!.Value;
@@ -1161,9 +1233,35 @@ public sealed class XfaLayoutEngine
                     // Use first content run's formatting as dominant for line-level chunking
                     var firstRun = para.Runs.FirstOrDefault(r => !string.IsNullOrWhiteSpace(r.Text));
                     if (firstRun is null) firstRun = para.Runs[0];
-                    fmtLines.Add((paraText, firstRun.Bold, firstRun.Italic, firstRun.Underline,
-                        firstRun.FontSizePt, firstRun.FontFamily,
-                        hasMultipleFormats ? textRuns : null));
+
+                    // Pre-wrap long paragraphs into individual visual lines so that page
+                    // chunking can split mid-paragraph. Without this, a paragraph that wraps
+                    // to N lines is treated as an atomic unit — if only M<N lines fit on the
+                    // current page, the remaining N-M lines are lost (clipped by page boundary).
+                    double paraFontSizePt = firstRun.FontSizePt ?? field.Font.SizePt;
+                    double paraCharWidthMm = paraFontSizePt * 0.3528 * 0.48;
+                    if (firstRun.Bold) paraCharWidthMm *= 1.08;
+                    double paraCharsPerLine = textW / Math.Max(paraCharWidthMm, 0.5);
+                    var wrappedLines = WordWrapText(paraText, paraCharsPerLine);
+
+                    if (wrappedLines.Count <= 1)
+                    {
+                        // Single line or short paragraph — keep as-is
+                        fmtLines.Add((paraText, firstRun.Bold, firstRun.Italic, firstRun.Underline,
+                            firstRun.FontSizePt, firstRun.FontFamily,
+                            hasMultipleFormats ? textRuns : null));
+                    }
+                    else
+                    {
+                        // Multi-line paragraph — add each visual line as a separate fmtLine.
+                        // First line gets inline runs (if any), subsequent lines get plain text.
+                        for (int wi = 0; wi < wrappedLines.Count; wi++)
+                        {
+                            fmtLines.Add((wrappedLines[wi], firstRun.Bold, firstRun.Italic, firstRun.Underline,
+                                firstRun.FontSizePt, firstRun.FontFamily,
+                                wi == 0 && hasMultipleFormats ? textRuns : null));
+                        }
+                    }
                 }
             }
 
@@ -3176,6 +3274,52 @@ public sealed class XfaLayoutEngine
             total += Math.Max(wrapped, 1);
         }
         return total;
+    }
+
+    /// <summary>
+    /// Word-wraps text into individual visual lines based on estimated characters per line.
+    /// Uses word boundaries to avoid breaking mid-word (same logic as EstimateTextHeight).
+    /// </summary>
+    private static List<string> WordWrapText(string text, double charsPerLine)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrEmpty(text))
+        {
+            result.Add("");
+            return result;
+        }
+
+        // Process each hard line break separately
+        var hardLines = text.Split('\n');
+        foreach (var hardLine in hardLines)
+        {
+            if (hardLine.Length == 0)
+            {
+                result.Add("");
+                continue;
+            }
+
+            var words = hardLine.Split(' ');
+            var currentLine = new System.Text.StringBuilder();
+            foreach (var word in words)
+            {
+                if (currentLine.Length > 0 && currentLine.Length + 1 + word.Length > charsPerLine)
+                {
+                    result.Add(currentLine.ToString());
+                    currentLine.Clear();
+                    currentLine.Append(word);
+                }
+                else
+                {
+                    if (currentLine.Length > 0) currentLine.Append(' ');
+                    currentLine.Append(word);
+                }
+            }
+            if (currentLine.Length > 0)
+                result.Add(currentLine.ToString());
+        }
+
+        return result;
     }
 
     // ===================== Column Width Parsing =====================
