@@ -47,6 +47,12 @@ public sealed class XfaLayoutEngine
         XfaDataNode? DataCtx);
     private readonly Stack<OverflowTrailerContext> _overflowTrailerStack = new();
 
+    // Accumulated top margin from ancestor subforms (XFA box model continuation).
+    // When content overflows to a new page within a subform, the ancestor subforms'
+    // top margins must be re-applied on the continuation page so content doesn't
+    // start at the raw content area top.
+    private double _continuationTopMargin = 0;
+
     public XfaLayoutEngine(List<XfaPageArea> pageAreas, XfaData data, bool verbose,
         XfaScriptEngine? scriptEngine = null)
     {
@@ -273,6 +279,42 @@ public sealed class XfaLayoutEngine
                     AdvanceToNextPage(ref curY, ref pageBottom);
                 }
 
+                // Invisible spacer keep-with-next: when a spacer subform (all children invisible,
+                // e.g., element_leerzeile) is near the page bottom and the next data child's
+                // content would overflow, advance the page BEFORE the spacer so its space
+                // appears at the top of the new page (not wasted at the bottom of the current).
+                // This matches Adobe's rendering behavior for invisible XFA spacers.
+                bool isSpacerSubform = matchedTemplate.Children.Count > 0
+                    && matchedTemplate.Children.All(c => c.Presence is "invisible");
+                if (isSpacerSubform && curY < pageBottom)
+                {
+                    // Estimate spacer height
+                    double spacerH = EstimateMinChildHeight(matchedTemplate, availW, dataChild);
+                    // Find next data child with a matching visible template
+                    for (int ndi = di + 1; ndi < dataChildren.Count; ndi++)
+                    {
+                        var nextDataChild = dataChildren[ndi];
+                        if (templateByDataName.TryGetValue(nextDataChild.Name, out var nextTemplate))
+                        {
+                            bool nextIsInvisible = nextTemplate.Children.Count > 0
+                                && nextTemplate.Children.All(c => c.Presence is "invisible");
+                            if (!nextIsInvisible)
+                            {
+                                double nextH = EstimateMinChildHeight(nextTemplate, availW, nextDataChild);
+                                if (curY + spacerH + nextH > pageBottom)
+                                {
+                                    // Next visible element would overflow — move spacer to new page
+                                    EmitOverflowTrailer(ref curY, pageBottom);
+                                    AdvanceToNextPage(ref curY, ref pageBottom);
+                                    EmitOverflowLeader(ref curY, pageBottom);
+                                }
+                                break;
+                            }
+                        }
+                        else break; // unmatched data child, stop looking
+                    }
+                }
+
                 double h = LayoutSubformSingleInstance(matchedTemplate, x, ref curY, availW, pageBottom, instanceData);
                 totalH += h;
             }
@@ -425,6 +467,7 @@ public sealed class XfaLayoutEngine
                 }
             }
 
+            _continuationTopMargin += marginTop;
             switch (subform.Layout)
             {
                 case "tb":
@@ -448,6 +491,7 @@ public sealed class XfaLayoutEngine
                     LayoutTb(subform.Children, innerX, ref innerY, innerW, pageBottom, instanceData);
                     break;
             }
+            _continuationTopMargin -= marginTop;
 
             if (pushedTrailer)
                 _overflowTrailerStack.Pop();
@@ -544,6 +588,7 @@ public sealed class XfaLayoutEngine
             }
         }
 
+        _continuationTopMargin += marginTop;
         switch (subform.Layout)
         {
             case "tb":
@@ -566,13 +611,28 @@ public sealed class XfaLayoutEngine
                 LayoutTb(subform.Children, innerX, ref innerY, innerW, pageBottom, dataCtx);
                 break;
         }
+        _continuationTopMargin -= marginTop;
 
         if (pushedTrailer)
             _overflowTrailerStack.Pop();
         if (pushedLeader)
             _overflowLeaderStack.Pop();
 
-        double subformH = innerY - startY + marginBottom;
+        double contentH = innerY - startY;
+        double subformH = contentH + marginBottom;
+        // XFA 3.3 Ch.8 Growable Containers: when a data-driven subform has no explicit H/minH
+        // and its children produce zero content height, collapse the bottom margin.
+        // This targets empty choice-set subforms (e.g., element_komplexer_dmstext with empty
+        // data node) where the subform has a subformSet child that found no matching data.
+        // Only collapse when data context is an empty leaf node to avoid cascading to
+        // structural wrappers (Abstandshalter, Rahmen, block) which share parent data.
+        if (contentH <= 0 && !subform.H.HasValue && !subform.MinH.HasValue
+            && marginBottom > 0
+            && dataCtx is not null && dataCtx.Children.Count == 0
+            && subform.Children.Any(c => c is XfaSubformSetDef))
+        {
+            subformH = 0;
+        }
         // Enforce maxH constraint (XFA 3.3 Ch.8)
         if (subform.MaxH.HasValue)
             subformH = Math.Min(subformH, subform.MaxH.Value);
@@ -615,6 +675,32 @@ public sealed class XfaLayoutEngine
                 EmitOverflowTrailer(ref curY, pageBottom);
                 AdvanceToNextPage(ref curY, ref pageBottom);
                 EmitOverflowLeader(ref curY, pageBottom);
+            }
+
+            // Keep invisible spacers with next visible sibling:
+            // If an invisible field (e.g., element_leerzeile) would be placed near the page bottom
+            // and the next visible sibling would overflow to the next page, advance the page BEFORE
+            // placing the spacer so its space appears at the top of the new page (not wasted at
+            // the bottom of the current page). This matches Adobe's XFA renderer behavior.
+            if (child is XfaFieldDef { Presence: "invisible" } invisField)
+            {
+                double invH = invisField.H ?? invisField.MinH ?? invisField.Margin.Bottom;
+                double remaining = pageBottom - curY;
+                if (invH < remaining) // spacer fits on current page
+                {
+                    var nextVisible = FindNextVisibleSibling(children, i + 1);
+                    if (nextVisible is not null)
+                    {
+                        double nextMinH = EstimateMinChildHeight(nextVisible, availW, dataCtx);
+                        if (curY + invH + nextMinH > pageBottom)
+                        {
+                            // Next element would overflow — move spacer to new page
+                            EmitOverflowTrailer(ref curY, pageBottom);
+                            AdvanceToNextPage(ref curY, ref pageBottom);
+                            EmitOverflowLeader(ref curY, pageBottom);
+                        }
+                    }
+                }
             }
 
             LayoutElement(child, x, ref curY, availW, pageBottom, dataCtx);
@@ -954,7 +1040,8 @@ public sealed class XfaLayoutEngine
         }
 
         // Compute height: invisible fields take up layout space but are not rendered (XFA spec).
-        // element_leerzeile: minH=4mm, bottomInset=2mm. Per XFA spec, use minH for layout height.
+        // In XFA, minH specifies the total field box height (including margins/border).
+        // element_leerzeile: minH=4mm (total height including bottomInset=2mm).
         double fieldH;
         if (invisible)
         {
@@ -1271,6 +1358,24 @@ public sealed class XfaLayoutEngine
                 }
                 if (hasFormatting)
                 {
+                    // Compute full rich text content height BEFORE rendering,
+                    // so paragraphs like "siehe Anlage" aren't clipped by an
+                    // underestimated initial fieldH from EstimateTextHeight.
+                    var heightSegments = XfaDataParser.ParseRichTextSegments(dataNode.RichTextHtml);
+                    double fullContentH = 0;
+                    foreach (var seg2 in heightSegments)
+                    {
+                        double fs2 = seg2.FontSizePt ?? renderFont.SizePt;
+                        double lh2 = fs2 * 0.3528 * 1.2;
+                        int lc2 = 1;
+                        foreach (char c in seg2.Text)
+                            if (c == '\n') lc2++;
+                        fullContentH += lc2 * lh2;
+                    }
+                    double fullH = fullContentH + field.Margin.Top + field.Margin.Bottom;
+                    if (fullH > fieldH)
+                        fieldH = fullH;
+
                     double segY = textY;
                     // fieldBottom is the maximum Y the paragraphs can extend to.
                     // Paragraphs beyond this boundary are clamped to prevent visual overlaps.
@@ -1352,23 +1457,7 @@ public sealed class XfaLayoutEngine
                         if (segY >= fieldBottom) break;
                     }
 
-                    // Compute field height from per-span segments (same as old approach).
-                    // Per-span segments give a conservative height estimate matching Adobe's
-                    // layout, while the paragraph-based rendering above handles visual output.
-                    var heightSegments = XfaDataParser.ParseRichTextSegments(dataNode.RichTextHtml);
-                    double fullContentH = 0;
-                    foreach (var seg2 in heightSegments)
-                    {
-                        double fs = seg2.FontSizePt ?? renderFont.SizePt;
-                        double lh = fs * 0.3528 * 1.2;
-                        int lc = 1;
-                        foreach (char c in seg2.Text)
-                            if (c == '\n') lc++;
-                        fullContentH += lc * lh;
-                    }
-                    double fullH = fullContentH + field.Margin.Top + field.Margin.Bottom;
-                    if (fullH > fieldH)
-                        fieldH = fullH;
+                    // Height already computed before the rendering loop above.
                     goto fieldDone;
                 }
             }
@@ -1971,7 +2060,7 @@ public sealed class XfaLayoutEngine
             _pageToAreaMap.Add(_currentPageAreaIdx);
 
         var ca = GetContentArea(_currentPage);
-        curY = ca.Y;
+        curY = ca.Y + _continuationTopMargin * 0.5;
         pageBottom = ca.Y + ca.H;
     }
 
@@ -2935,10 +3024,13 @@ public sealed class XfaLayoutEngine
 
     private static double EstimateTextHeight(string text, XfaFont font, double widthMm, XfaMargin margin)
     {
-        // Margins (insets) are visual padding WITHIN the field box. They do NOT increase the
-        // field height beyond minH. The text renderer applies them internally. This matches
-        // Adobe's reference output where minH controls the row height exactly.
-        double singleLineH = font.SizePt * 0.3528 * 1.15;
+        // Returns the total field box height (text content + vertical margins).
+        // The caller subtracts margins to get the text drawing area, so we must include
+        // them here to ensure multi-line text has enough room.
+        // For minH-controlled fields, Math.Max(fieldH, minH) in the caller ensures
+        // single-line fields still use the minH box height.
+        double verticalMargins = margin.Top + margin.Bottom;
+        double singleLineH = font.SizePt * 0.3528 * 1.15 + verticalMargins;
         if (string.IsNullOrEmpty(text)) return Math.Max(singleLineH, 3);
 
         double availW = widthMm - margin.Left - margin.Right;
@@ -2988,7 +3080,7 @@ public sealed class XfaLayoutEngine
         // Multi-line: use 1.15x line height factor (calibrated against Adobe reference output;
         // reduced from 1.2 to compensate for corrected invisible field height minH).
         double lineHeightMm = font.SizePt * 0.3528 * 1.15;
-        double textH = totalLines * lineHeightMm;
+        double textH = totalLines * lineHeightMm + verticalMargins;
 
         return Math.Max(textH, singleLineH);
     }

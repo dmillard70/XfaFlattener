@@ -292,7 +292,7 @@ public sealed partial class XfaDataParser
 
         // Trailing blank paragraphs in XFA rich text (xfa-spacerun spacers) contribute to
         // field height. Adobe's renderer preserves some trailing blanks but not unlimited.
-        // Cap trailing blank lines to 2 to match reference behavior.
+        // Cap trailing blank lines to 3 to better match reference block heights.
         if (segments.Count > 0)
         {
             var last = segments[^1];
@@ -301,10 +301,10 @@ public sealed partial class XfaDataParser
             int trailingNewlines = 0;
             for (int i = text.Length - 1; i >= 0 && text[i] == '\n'; i--)
                 trailingNewlines++;
-            // Keep at most 2 trailing blank lines (each \n = one blank paragraph boundary)
-            if (trailingNewlines > 2)
+            // Keep at most 4 trailing blank lines (each \n = one blank paragraph boundary)
+            if (trailingNewlines > 4)
             {
-                string trimmed = text[..^(trailingNewlines - 2)];
+                string trimmed = text[..^(trailingNewlines - 4)];
                 segments[^1] = last with { Text = trimmed };
             }
         }
