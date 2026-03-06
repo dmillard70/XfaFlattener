@@ -1018,10 +1018,14 @@ public sealed class XfaLayoutEngine
         if (field.HideIfEmpty && string.IsNullOrEmpty(text))
             return 0;
 
-        // Caption reserve: template default for height estimation (layout), JS override for rendering.
-        // XFA form:ready scripts run AFTER layout — they modify visual properties, not layout flow.
-        double? captionReserveForLayout = field.CaptionReserve;
+        // Caption reserve: use JS override for both layout and rendering.
+        // XFA form:ready scripts run AFTER layout per spec, but caption.reserve changes affect
+        // text area width and therefore line wrapping and field height. Using the template default
+        // for layout but JS override for rendering causes text clipping when the JS makes the
+        // reserve wider (e.g., abstand1=50mm vs template=35mm → text wraps to 2 lines at render
+        // time but height was estimated for 1 line at layout time).
         double? captionReserve = GetCaptionReserveOverride(field, dataCtx) ?? field.CaptionReserve;
+        double? captionReserveForLayout = captionReserve;
 
         var (dataBold, dataItalic) = DetectRichTextFormatting(field, dataCtx);
 
