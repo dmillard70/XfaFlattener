@@ -1383,7 +1383,18 @@ public sealed class XfaLayoutEngine
             return fieldH + (field.Para.SpaceBefore ?? 0) + (field.Para.SpaceAfter ?? 0);
         }
 
-        if (!invisible && !string.IsNullOrEmpty(text))
+        // Resolve caption text early so we can check if it exists before deciding to render.
+        // Fields with a caption should render even when value text is empty (e.g., "Vortaxe Qualität:" label).
+        string? captionText = field.CaptionText;
+        if (field.CaptionBindRef is not null && dataCtx is not null)
+        {
+            string? overriddenCaption = ResolveSimpleRef(field.CaptionBindRef, dataCtx);
+            if (overriddenCaption is not null)
+                captionText = overriddenCaption;
+        }
+        bool hasCaptionToRender = captionText is not null && captionReserve.HasValue;
+
+        if (!invisible && (!string.IsNullOrEmpty(text) || hasCaptionToRender))
         {
             double textX = fieldX + field.Margin.Left;
             double textY = fieldY + field.Margin.Top;
@@ -1401,15 +1412,7 @@ public sealed class XfaLayoutEngine
                 };
             }
 
-            // Handle caption (static text or data-bound via setProperty)
-            // setProperty OVERRIDES static caption text (e.g., "Bezeichner:" → "Votierung erfolgt durch:")
-            string? captionText = field.CaptionText;
-            if (field.CaptionBindRef is not null && dataCtx is not null)
-            {
-                string? overriddenCaption = ResolveSimpleRef(field.CaptionBindRef, dataCtx);
-                if (overriddenCaption is not null)
-                    captionText = overriddenCaption;
-            }
+            // Handle caption (already resolved above)
             if (captionText is not null && captionReserve.HasValue)
             {
                 string placement = field.CaptionPlacement ?? "left";
@@ -1617,13 +1620,16 @@ public sealed class XfaLayoutEngine
                 }
             }
 
-            _items.Add(new LayoutItem(
-                PageIndex: _currentPage,
-                X: textX, Y: textY, W: textW, H: textH,
-                Text: text,
-                Font: renderFont,
-                Para: field.Para,
-                Rotate: field.Rotate));
+            if (!string.IsNullOrEmpty(text))
+            {
+                _items.Add(new LayoutItem(
+                    PageIndex: _currentPage,
+                    X: textX, Y: textY, W: textW, H: textH,
+                    Text: text,
+                    Font: renderFont,
+                    Para: field.Para,
+                    Rotate: field.Rotate));
+            }
             fieldDone:;
         }
 
@@ -1635,7 +1641,7 @@ public sealed class XfaLayoutEngine
             var fillDataNode = ResolveFieldDataNode(field, dataCtx);
             bool hasNoData = fillDataNode is null;
             if (hasNoData && field.Border.FillColor is not null
-                && field.CaptionText is null)
+                && field.CaptionText is null && field.CaptionBindRef is null)
             {
                 // Emit stroke border only, no fill
                 if (field.Border.Visible && field.Border.Thickness > 0)
