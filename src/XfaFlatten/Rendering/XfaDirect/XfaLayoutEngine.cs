@@ -313,7 +313,20 @@ public sealed class XfaLayoutEngine
                             if (!nextIsInvisible)
                             {
                                 double nextH = EstimateMinChildHeight(nextTemplate, availW, nextDataChild);
-                                if (curY + spacerH + nextH > pageBottom)
+                                bool shouldAdvance = curY + spacerH + nextH > pageBottom;
+
+                                // Also check: if the next element is a header (h1/h2) that would
+                                // trigger keepWithNext, the spacer must move with it. Otherwise
+                                // the spacer stays at the bottom of the current page while the
+                                // header moves to the next page, wasting the spacer's space.
+                                if (!shouldAdvance && IsKeepWithNextHeader(nextDataChild, nextTemplate,
+                                        ndi, dataChildren, templateByDataName,
+                                        curY + spacerH, pageBottom, availW))
+                                {
+                                    shouldAdvance = true;
+                                }
+
+                                if (shouldAdvance)
                                 {
                                     // Next visible element would overflow — move spacer to new page
                                     EmitOverflowTrailer(ref curY, pageBottom);
@@ -1297,6 +1310,7 @@ public sealed class XfaLayoutEngine
 
             double emittedY = fieldY;
             int lineOffset = 0;
+            double lastSubY = fieldY + field.Margin.Top; // track end of last content chunk
             while (lineOffset < fmtLines.Count)
             {
                 double availH = pageBottom - emittedY - field.Margin.Top - field.Margin.Bottom;
@@ -1388,6 +1402,7 @@ public sealed class XfaLayoutEngine
                     subY += subH;
                     subStart = subEnd;
                 }
+                lastSubY = subY; // track actual content end position
                 lineOffset += sourceLinesUsed;
                 if (lineOffset < fmtLines.Count)
                 {
@@ -1398,7 +1413,7 @@ public sealed class XfaLayoutEngine
                 }
             }
 
-            curY = emittedY + field.Margin.Top + field.Margin.Bottom;
+            curY = lastSubY + field.Margin.Bottom;
 
             return fieldH + (field.Para.SpaceBefore ?? 0) + (field.Para.SpaceAfter ?? 0);
         }
@@ -3595,6 +3610,11 @@ public sealed class XfaLayoutEngine
         }
 
         // Parse spalteN definitions from defaults
+        // The oDynamicTable JavaScript uses parseFloat() to extract numeric values,
+        // then distributes columns proportionally. This handles all formats:
+        //   "3", "30"       → unitless proportional weights
+        //   "7mm", "25mm"   → parseFloat extracts 7, 25 as proportional weights
+        //   "26%", "8%"     → parseFloat extracts 26, 8 as proportional weights
         var colDefs = new SortedDictionary<int, (double width, string hAlign)>();
         foreach (var child in defaults.Children)
         {
@@ -3606,10 +3626,12 @@ public sealed class XfaLayoutEngine
 
             double width = 10; // default
             string? widthStr = child.GetAttribute("width");
-            if (widthStr is not null && double.TryParse(widthStr,
-                    System.Globalization.NumberStyles.Float,
-                    System.Globalization.CultureInfo.InvariantCulture, out double w))
-                width = w;
+            if (widthStr is not null)
+            {
+                // Extract leading numeric value, mimicking JavaScript parseFloat()
+                // which ignores trailing non-numeric characters
+                width = ParseFloatLike(widthStr) ?? 10;
+            }
 
             string hAlign = child.GetAttribute("horizontal") ?? "left";
             colDefs[colIdx] = (width, hAlign);
@@ -3619,25 +3641,69 @@ public sealed class XfaLayoutEngine
 
         int numCols = Math.Max(colDefs.Keys.Max() + 1, templateColumnCount);
 
-        // Compute proportional column widths (data widths are relative/percentage-like)
-        double totalRelative = colDefs.Values.Sum(d => d.width);
         double[] colWidths = new double[numCols];
         string[] colAligns = new string[numCols];
-        for (int i = 0; i < numCols; i++)
+
+        // Proportional distribution: each column gets its weight / totalWeight * tableWidth
         {
-            if (colDefs.TryGetValue(i, out var def))
+            double totalRelative = colDefs.Values.Sum(d => d.width);
+            for (int i = 0; i < numCols; i++)
             {
-                colWidths[i] = totalRelative > 0 ? (def.width / totalRelative) * tableWidth : tableWidth / numCols;
-                colAligns[i] = def.hAlign;
-            }
-            else
-            {
-                colWidths[i] = tableWidth / numCols;
-                colAligns[i] = null!; // no data-driven alignment — preserve template hAlign
+                if (colDefs.TryGetValue(i, out var def))
+                {
+                    colWidths[i] = totalRelative > 0 ? (def.width / totalRelative) * tableWidth : tableWidth / numCols;
+                    colAligns[i] = def.hAlign;
+                }
+                else
+                {
+                    colWidths[i] = tableWidth / numCols;
+                    colAligns[i] = null!;
+                }
             }
         }
 
         return (colWidths, colAligns);
+    }
+
+    /// <summary>
+    /// Extracts the leading numeric value from a string, mimicking JavaScript's parseFloat().
+    /// "84mm" → 84, "26%" → 26, "3" → 3, "1.5in" → 1.5
+    /// </summary>
+    private static double? ParseFloatLike(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+
+        // Find the end of the numeric prefix (digits, '.', '-', '+')
+        int end = 0;
+        bool hasDot = false;
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (char.IsDigit(c))
+            {
+                end = i + 1;
+            }
+            else if (c == '.' && !hasDot)
+            {
+                hasDot = true;
+                end = i + 1;
+            }
+            else if ((c == '-' || c == '+') && i == 0)
+            {
+                end = i + 1;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (end == 0) return null;
+        string numStr = value.Substring(0, end);
+        if (double.TryParse(numStr, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out double result))
+            return result;
+        return null;
     }
 
     /// <summary>

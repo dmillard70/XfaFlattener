@@ -504,8 +504,10 @@ public sealed class XfaTemplateParser
         double? maxH = ParseMeasurement(GetAttr(node, "maxH"));
         if (maxH is 0) maxH = null;
 
+        var parsedMargin = ParseMarginElement(node);
+        string? sfName = GetAttr(node, "name");
         return new XfaSubformDef(
-            Name: GetAttr(node, "name"),
+            Name: sfName,
             X: ParseMeasurement(GetAttr(node, "x")),
             Y: ParseMeasurement(GetAttr(node, "y")),
             W: ParseMeasurement(GetAttr(node, "w")),
@@ -518,7 +520,7 @@ public sealed class XfaTemplateParser
             OccurMax: occurMax,
             BindRef: ParseBindRef(node),
             BindMatch: ParseBindMatch(node),
-            Margin: ParseMarginElement(node),
+            Margin: parsedMargin,
             Border: ParseBorderElement(node),
             ColumnWidths: columnWidths,
             HasBreakBefore: hasBreakBefore,
