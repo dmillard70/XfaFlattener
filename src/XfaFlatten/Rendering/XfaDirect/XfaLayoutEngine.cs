@@ -638,13 +638,10 @@ public sealed class XfaLayoutEngine
         // data node) where the subform has a subformSet child that found no matching data.
         // Only collapse when data context is an empty leaf node to avoid cascading to
         // structural wrappers (Abstandshalter, Rahmen, block) which share parent data.
-        if (contentH <= 0 && !subform.H.HasValue && !subform.MinH.HasValue
-            && marginBottom > 0
-            && dataCtx is not null && dataCtx.Children.Count == 0
-            && subform.Children.Any(c => c is XfaSubformSetDef))
-        {
-            subformH = 0;
-        }
+        // XFA 3.3 Ch.8: Empty data-driven subforms (e.g., element_komplexer_dmstext with
+        // empty data node) still contribute their margin space. Previously collapsed to 0,
+        // but this caused a ~16pt positioning drift at page boundaries. The reference PDF
+        // renders these empty instances with their bottom margin preserved.
         // Enforce maxH constraint (XFA 3.3 Ch.8)
         if (subform.MaxH.HasValue)
             subformH = Math.Min(subformH, subform.MaxH.Value);
