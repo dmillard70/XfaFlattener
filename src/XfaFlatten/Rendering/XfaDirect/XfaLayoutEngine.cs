@@ -2243,7 +2243,7 @@ public sealed class XfaLayoutEngine
             _pageToAreaMap.Add(_currentPageAreaIdx);
 
         var ca = GetContentArea(_currentPage);
-        curY = ca.Y + _continuationTopMargin * 0.5;
+        curY = ca.Y + _continuationTopMargin * 1.0;
         pageBottom = ca.Y + ca.H;
     }
 
