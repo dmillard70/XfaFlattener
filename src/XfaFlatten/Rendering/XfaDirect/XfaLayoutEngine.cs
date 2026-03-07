@@ -1402,11 +1402,13 @@ public sealed class XfaLayoutEngine
             }
 
             // Handle caption (static text or data-bound via setProperty)
+            // setProperty OVERRIDES static caption text (e.g., "Bezeichner:" → "Votierung erfolgt durch:")
             string? captionText = field.CaptionText;
-            if (captionText is null && field.CaptionBindRef is not null && dataCtx is not null)
+            if (field.CaptionBindRef is not null && dataCtx is not null)
             {
-                // Resolve caption text from data (setProperty target="caption.value.#text" ref="bezeichner2")
-                captionText = ResolveSimpleRef(field.CaptionBindRef, dataCtx);
+                string? overriddenCaption = ResolveSimpleRef(field.CaptionBindRef, dataCtx);
+                if (overriddenCaption is not null)
+                    captionText = overriddenCaption;
             }
             if (captionText is not null && captionReserve.HasValue)
             {
@@ -1488,23 +1490,46 @@ public sealed class XfaLayoutEngine
                 }
                 if (hasFormatting)
                 {
-                    // Compute full rich text content height BEFORE rendering,
-                    // so paragraphs like "siehe Anlage" aren't clipped by an
-                    // underestimated initial fieldH from EstimateTextHeight.
-                    var heightSegments = XfaDataParser.ParseRichTextSegments(dataNode.RichTextHtml);
-                    double fullContentH = 0;
-                    foreach (var seg2 in heightSegments)
+                    // Compute full rich text content height BEFORE rendering, using the
+                    // same per-paragraph word-wrap logic as height estimation but with the
+                    // 1.2 rendering line-height multiplier (vs 1.15 for layout estimation).
+                    // This prevents the last paragraphs from being clipped when the accumulated
+                    // difference between estimation (1.15) and rendering (1.2) multipliers
+                    // causes the rendering to consume more vertical space than estimated.
+                    double fullContentH = field.Margin.Top + field.Margin.Bottom;
+                    foreach (var para2 in paragraphs)
                     {
-                        double fs2 = seg2.FontSizePt ?? renderFont.SizePt;
-                        double lh2 = fs2 * 0.3528 * 1.2;
-                        int lc2 = 1;
-                        foreach (char c in seg2.Text)
-                            if (c == '\n') lc2++;
-                        fullContentH += lc2 * lh2;
+                        fullContentH += (para2.MarginTopPt ?? 0) * 0.3528;
+                        fullContentH += (para2.MarginBottomPt ?? 0) * 0.3528;
+                        double pFontPt = para2.Runs.Count > 0 && para2.Runs[0].FontSizePt is { } pfs2
+                            ? pfs2 : renderFont.SizePt;
+                        bool isEmpty = para2.Runs.Count == 0
+                            || (para2.Runs.Count == 1 && string.IsNullOrEmpty(para2.Runs[0].Text));
+                        if (isEmpty) { fullContentH += pFontPt * 0.3528 * 1.2; continue; }
+                        double pCharW = pFontPt * 0.3528 * 0.48;
+                        if (para2.Runs.Any(r => r.Bold)) pCharW *= 1.08;
+                        double pW = textW;
+                        if (para2.MarginLeftPt.HasValue) pW -= para2.MarginLeftPt.Value * 0.3528;
+                        if (pW <= 0) pW = textW;
+                        string pText = string.Join("", para2.Runs.Select(r => r.Text));
+                        int pLines = 0;
+                        foreach (var hl in pText.Split('\n'))
+                        {
+                            if (hl.Length == 0) { pLines++; continue; }
+                            var words = hl.Split(' ');
+                            int lc = 1; double lw = 0;
+                            foreach (var w in words)
+                            {
+                                double ww = w.Length * pCharW;
+                                if (lw > 0 && lw + pCharW + ww > pW) { lc++; lw = ww; }
+                                else { lw += (lw > 0 ? pCharW : 0) + ww; }
+                            }
+                            pLines += lc;
+                        }
+                        fullContentH += pLines * pFontPt * 0.3528 * 1.2;
                     }
-                    double fullH = fullContentH + field.Margin.Top + field.Margin.Bottom;
-                    if (fullH > fieldH)
-                        fieldH = fullH;
+                    if (fullContentH > fieldH)
+                        fieldH = fullContentH;
 
                     double segY = textY;
                     // fieldBottom is the maximum Y the paragraphs can extend to.
