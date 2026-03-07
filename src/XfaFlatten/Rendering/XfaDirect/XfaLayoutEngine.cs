@@ -815,6 +815,28 @@ public sealed class XfaLayoutEngine
             colWidths = dynSettings.Value.columnWidths;
         }
 
+        // When column widths contain 0mm entries (no oDynamicTable data and no explicit widths),
+        // infer column widths from the first row's children element widths.
+        // This handles tables like tabelle_obligo where columnWidths="58mm 0mm 0mm 0mm 0mm 0mm 0mm"
+        // but header draw elements have explicit widths (e.g., obligo=21mm, real=20mm).
+        if (colWidths.Any(w => w < 0.5))
+        {
+            var firstRow = table.Children.OfType<XfaSubformDef>()
+                .FirstOrDefault(c => c.Layout == "row");
+            if (firstRow is not null)
+            {
+                int colIdx = 0;
+                foreach (var cell in firstRow.Children)
+                {
+                    if (colIdx >= colWidths.Length) break;
+                    int span = Math.Max(1, cell.ColSpan == -1 ? colWidths.Length - colIdx : cell.ColSpan);
+                    if (colWidths[colIdx] < 0.5 && cell.W.HasValue && cell.W.Value > 0.5)
+                        colWidths[colIdx] = cell.W.Value;
+                    colIdx += span;
+                }
+            }
+        }
+
         foreach (var child in table.Children)
         {
             if (child is XfaSubformDef row && row.Layout == "row")
@@ -3389,8 +3411,11 @@ public sealed class XfaLayoutEngine
         // Scale up placeholder column widths: when the total is much less than available
         // width, the template uses placeholder values (e.g., all 10mm) that the XFA engine
         // would redistribute at runtime. Scale proportionally to fill available width.
+        // Skip scaling when any column is 0mm — 0mm columns are dynamically set (oDynamicTable
+        // or inferred from element widths), and scaling would inflate the non-zero columns.
         double sum = widths.Sum();
-        if (sum > 0 && sum < totalWidth * 0.6)
+        bool hasZeroCols = widths.Any(w => w < 0.01);
+        if (sum > 0 && sum < totalWidth * 0.6 && !hasZeroCols)
         {
             double scale = totalWidth / sum;
             for (int i = 0; i < widths.Length; i++)
