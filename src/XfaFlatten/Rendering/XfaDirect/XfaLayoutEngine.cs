@@ -1089,7 +1089,7 @@ public sealed class XfaLayoutEngine
             // ParseRichTextRuns preserves paragraph boundaries, CSS margins (margin-left, text-indent),
             // and per-paragraph font sizes. This avoids underestimation from:
             // - consolidation losing paragraph structure (ParseRichTextSegments merges same-format paragraphs)
-            // - wrong char width factor (SparkasseRg=0.55 vs Arial=0.48)
+            // - font-specific char width factor (SparkasseRg=0.55 vs Arial=0.48 via GetCharWidthFactor)
             // - ignoring hanging indent (margin-left:18pt reduces available width for continuation lines)
             double? richTextH = null;
             var estimateDataNode = ResolveFieldDataNode(field, dataCtx);
@@ -1121,8 +1121,8 @@ public sealed class XfaLayoutEngine
                             continue;
                         }
 
-                        // Char width estimation (0.48 calibrated for Arial; works well for most fonts)
-                        double paraCharW = paraFontPt * 0.3528 * 0.48;
+                        // Char width factor: SparkasseRg glyphs are wider than Arial
+                        double paraCharW = paraFontPt * 0.3528 * GetCharWidthFactor(paraFontFamily ?? field.Font.Typeface);
                         if (para.Runs.Any(r => r.Bold)) paraCharW *= 1.08;
 
                         // Account for paragraph margin-left reducing available width
@@ -1193,7 +1193,7 @@ public sealed class XfaLayoutEngine
 
             // Build fmtLines from rich text paragraphs or plain text
             var dataNode = ResolveFieldDataNode(field, dataCtx);
-            double charWidthMm = field.Font.SizePt * 0.3528 * 0.48;
+            double charWidthMm = field.Font.SizePt * 0.3528 * GetCharWidthFactor(field.Font.Typeface);
             double charsPerLine = textW / Math.Max(charWidthMm, 0.5);
 
             var fmtLines = new List<(string Text, bool Bold, bool Italic, bool Underline, double? FontSizePt, string? FontFamily, List<TextRun>? Runs)>();
@@ -1243,7 +1243,7 @@ public sealed class XfaLayoutEngine
                     // to N lines is treated as an atomic unit — if only M<N lines fit on the
                     // current page, the remaining N-M lines are lost (clipped by page boundary).
                     double paraFontSizePt = firstRun.FontSizePt ?? field.Font.SizePt;
-                    double paraCharWidthMm = paraFontSizePt * 0.3528 * 0.48;
+                    double paraCharWidthMm = paraFontSizePt * 0.3528 * GetCharWidthFactor(firstRun.FontFamily ?? field.Font.Typeface);
                     if (firstRun.Bold) paraCharWidthMm *= 1.08;
                     double paraCharsPerLine = textW / Math.Max(paraCharWidthMm, 0.5);
                     var wrappedLines = WordWrapText(paraText, paraCharsPerLine);
@@ -1319,7 +1319,7 @@ public sealed class XfaLayoutEngine
                     var subChunk = new System.Text.StringBuilder();
                     int subRendered = 0;
                     double subFontSizePt = curFontSize ?? field.Font.SizePt;
-                    double subCharWidthMm = subFontSizePt * 0.3528 * 0.48;
+                    double subCharWidthMm = subFontSizePt * 0.3528 * GetCharWidthFactor(curFontFamily ?? field.Font.Typeface);
                     double subCharsPerLine = textW / Math.Max(subCharWidthMm, 0.5);
                     // Collect TextRuns from single-line sub-chunks for inline rendering
                     List<TextRun>? singleLineRuns = null;
@@ -1351,12 +1351,13 @@ public sealed class XfaLayoutEngine
                             Italic = field.Font.Italic || curItalic,
                             Underline = field.Font.Underline || curUnderline
                         };
+                        string subText = subChunk.ToString();
                         if (subH > 0)
                         {
                             _items.Add(new LayoutItem(
                                 PageIndex: _currentPage,
                                 X: textX, Y: subY, W: textW, H: subH,
-                                Text: subChunk.ToString(),
+                                Text: subText,
                                 Font: subFont,
                                 Para: field.Para,
                                 Rotate: field.Rotate,
@@ -1509,7 +1510,8 @@ public sealed class XfaLayoutEngine
                         bool isEmpty = para2.Runs.Count == 0
                             || (para2.Runs.Count == 1 && string.IsNullOrEmpty(para2.Runs[0].Text));
                         if (isEmpty) { fullContentH += pFontPt * 0.3528 * 1.2; continue; }
-                        double pCharW = pFontPt * 0.3528 * 0.48;
+                        string? pFamily = para2.Runs.Count > 0 ? para2.Runs[0].FontFamily : null;
+                        double pCharW = pFontPt * 0.3528 * GetCharWidthFactor(pFamily ?? field.Font.Typeface);
                         if (para2.Runs.Any(r => r.Bold)) pCharW *= 1.08;
                         double pW = textW;
                         if (para2.MarginLeftPt.HasValue) pW -= para2.MarginLeftPt.Value * 0.3528;
@@ -1577,7 +1579,8 @@ public sealed class XfaLayoutEngine
                         }
                         else
                         {
-                            double charW = maxFontSizePt * 0.3528 * 0.48;
+                            string? runFamily = para.Runs.Count > 0 ? para.Runs[0].FontFamily : null;
+                            double charW = maxFontSizePt * 0.3528 * GetCharWidthFactor(runFamily ?? field.Font.Typeface);
                             double cpl = textW / Math.Max(charW, 0.5);
                             int lc = Math.Max(1, (int)Math.Ceiling(paraText.Length / Math.Max(cpl, 1)));
                             paraH = lc * paraLineH;
@@ -3236,9 +3239,8 @@ public sealed class XfaLayoutEngine
         double availW = widthMm - margin.Left - margin.Right;
         if (availW <= 0) availW = widthMm;
 
-        // Average character width is roughly 0.48 * font size in points (calibrated for Arial)
-        // Convert to mm: 1pt = 0.3528mm
-        double charWidthMm = font.SizePt * 0.3528 * 0.48;
+        // Average character width varies by font family. Convert to mm: 1pt = 0.3528mm
+        double charWidthMm = font.SizePt * 0.3528 * GetCharWidthFactor(font.Typeface);
         if (font.Bold) charWidthMm *= 1.08;
 
         double charsPerLine = availW / Math.Max(charWidthMm, 0.5);
@@ -3294,6 +3296,19 @@ public sealed class XfaLayoutEngine
         }
 
         return Math.Max(textH, singleLineH);
+    }
+
+    /// <summary>
+    /// Returns the average character width factor for a font family.
+    /// SparkasseRg glyphs are ~15% wider than Arial; using 0.48 (Arial) for SparkasseRg
+    /// underestimates line counts, causing text clipping in overflow sub-chunks.
+    /// </summary>
+    private static double GetCharWidthFactor(string? fontFamily)
+    {
+        if (fontFamily is not null
+            && fontFamily.StartsWith("Sparkasse", StringComparison.OrdinalIgnoreCase))
+            return 0.55;
+        return 0.48;
     }
 
     private static int CountTextLines(string text, XfaFont font, double widthMm)
