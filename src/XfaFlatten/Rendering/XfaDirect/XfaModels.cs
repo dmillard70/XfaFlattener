@@ -64,7 +64,8 @@ public record XfaFieldDef(
     List<XfaScript>? Scripts = null,
     double? MaxH = null,
     int ColSpan = 1,
-    string? AnchorType = null) : XfaElement(Name, X, Y, W, H, MinH, Presence, ColSpan);
+    string? AnchorType = null,
+    bool IsImageField = false) : XfaElement(Name, X, Y, W, H, MinH, Presence, ColSpan);
 
 /// <summary>
 /// A static draw element (text, line, rectangle) from the template.
@@ -233,7 +234,8 @@ public record LayoutItem(
     string? FillColor = null,
     List<TextRun>? Runs = null,
     double MarginLeftMm = 0,
-    double TextIndentMm = 0);
+    double TextIndentMm = 0,
+    byte[]? ImageData = null);
 
 /// <summary>
 /// Types of layout items for rendering.
@@ -243,7 +245,8 @@ public enum LayoutItemType
     Text,
     Line,
     Rectangle,
-    FilledRectangle
+    FilledRectangle,
+    Image
 }
 
 /// <summary>

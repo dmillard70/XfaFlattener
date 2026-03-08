@@ -207,14 +207,19 @@ public sealed class XfaTemplateParser
             }
         }
 
-        // Check for multiline
+        // Check for multiline and imageEdit
         bool isMultiLine = false;
+        bool isImageField = false;
         var uiNode = FindChild(node, "ui");
         if (uiNode is not null)
         {
             var textEditNode = FindChild(uiNode, "textEdit");
             if (textEditNode is not null)
                 isMultiLine = GetAttr(textEditNode, "multiLine") == "1";
+
+            var imageEditNode = FindChild(uiNode, "imageEdit");
+            if (imageEditNode is not null)
+                isImageField = true;
         }
 
         // Caption
@@ -265,13 +270,14 @@ public sealed class XfaTemplateParser
         }
 
         // Derive HideIfEmpty flag from scripts as a fallback for when script engine is not used.
-        // Pattern: if (this.rawValue == null || this.rawValue == "") { this.presence = "hidden"; }
-        // Only match this.rawValue checks (self-value). Do NOT match this.isNull — that has
-        // different semantics. Do NOT match external field checks like "BBUNTERSCHRIFT.rawValue != '1'".
+        // Pattern 1: if (this.rawValue == null || this.rawValue == "") { this.presence = "hidden"; }
+        // Pattern 2: if (this.isNull) this.presence = "hidden";
+        // Both patterns mean "hide when no data is bound" → maps to string.IsNullOrEmpty(text).
+        // Do NOT match external field checks like "BBUNTERSCHRIFT.rawValue != '1'".
         foreach (var script in scripts)
         {
             if (script.Source.Contains("this.presence") && script.Source.Contains("hidden", StringComparison.OrdinalIgnoreCase)
-                && script.Source.Contains("this.rawValue"))
+                && (script.Source.Contains("this.rawValue") || script.Source.Contains("this.isNull")))
             {
                 hideIfEmpty = true;
                 break;
@@ -306,7 +312,8 @@ public sealed class XfaTemplateParser
             Scripts: scripts.Count > 0 ? scripts : null,
             MaxH: ParseMeasurement(GetAttr(node, "maxH")),
             ColSpan: ParseColSpan(GetAttr(node, "colSpan")),
-            AnchorType: GetAttr(node, "anchorType"));
+            AnchorType: GetAttr(node, "anchorType"),
+            IsImageField: isImageField);
     }
 
     private XfaDrawDef ParseDraw(XmlNode node)

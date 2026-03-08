@@ -145,6 +145,15 @@ public sealed class XfaDirectEngine : IRenderEngine
             int textCount = layoutResult.Items.Count(i => i.ItemType == LayoutItemType.Text && !string.IsNullOrEmpty(i.Text));
             int lineCount = layoutResult.Items.Count(i => i.ItemType == LayoutItemType.Line);
             Console.WriteLine($"[XfaDirect] Text items: {textCount}, lines: {lineCount}");
+            // Per-page stats
+            for (int pg = 0; pg < layoutResult.TotalPages; pg++)
+            {
+                var pageItems = layoutResult.Items.Where(i => i.PageIndex == pg).ToList();
+                double maxY = pageItems.Count > 0 ? pageItems.Max(i => i.Y + i.H) : 0;
+                int pgText = pageItems.Count(i => i.ItemType == LayoutItemType.Text && !string.IsNullOrEmpty(i.Text));
+                int pgImg = pageItems.Count(i => i.ItemType == LayoutItemType.Image);
+                Console.WriteLine($"  Page {pg}: {pageItems.Count} items ({pgText} text, {pgImg} img), maxY={maxY:F1}mm");
+            }
         }
 
         // Step 6: Render to PDF

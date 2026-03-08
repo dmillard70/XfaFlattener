@@ -177,10 +177,17 @@ public sealed class XfaLayoutEngine
         double availW, double pageBottom, XfaDataNode? dataCtx)
     {
         // Skip hidden elements — but still process caption.reserve scripts
+        // Exception: image fields with presence="hidden" need to reach LayoutField
+        // for native image detection (they rely on JS to become visible).
         if (element.Presence is "hidden" or "inactive")
         {
             if (element is XfaFieldDef hiddenField)
             {
+                if (hiddenField.IsImageField)
+                {
+                    // Let image fields pass through to LayoutField for native handling
+                    return LayoutField(hiddenField, x, ref curY, availW, pageBottom, dataCtx);
+                }
                 if (hiddenField.Scripts is { Count: > 0 })
                     ProcessCaptionReserveScripts(hiddenField, dataCtx);
             }
@@ -287,6 +294,7 @@ public sealed class XfaLayoutEngine
                 if (IsKeepWithNextHeader(dataChild, matchedTemplate, di, dataChildren,
                     templateByDataName, curY, pageBottom, availW))
                 {
+                    if (_verbose) Console.WriteLine($"  [KeepHdr] keepWithNextHeader '{matchedTemplate.Name}' at curY={curY:F1}");
                     EmitOverflowTrailer(ref curY, pageBottom);
                     AdvanceToNextPage(ref curY, ref pageBottom);
                 }
@@ -329,6 +337,7 @@ public sealed class XfaLayoutEngine
                                 if (shouldAdvance)
                                 {
                                     // Next visible element would overflow — move spacer to new page
+                                    if (_verbose) Console.WriteLine($"  [SpacerKeep] spacer '{matchedTemplate.Name}' at curY={curY:F1}, nextH={nextH:F1}");
                                     EmitOverflowTrailer(ref curY, pageBottom);
                                     AdvanceToNextPage(ref curY, ref pageBottom);
                                     EmitOverflowLeader(ref curY, pageBottom);
@@ -429,6 +438,7 @@ public sealed class XfaLayoutEngine
         // Handle page break with optional target page area
         if (subform.HasBreakBefore)
         {
+            if (_verbose) Console.WriteLine($"  [Break] breakBefore on '{subform.Name}' at curY={curY:F1}");
             AdvanceToNextPage(ref curY, ref pageBottom, subform.BreakTarget, subform.BreakTargetType);
         }
 
@@ -457,6 +467,7 @@ public sealed class XfaLayoutEngine
                 double remaining = pageBottom - (curY + marginTop);
                 if (estimatedH > remaining && remaining < pageBottom * 0.5)
                 {
+                    if (_verbose) Console.WriteLine($"  [KeepIntact] '{subform.Name}' estH={estimatedH:F1} remaining={remaining:F1}, advancing page at curY={curY:F1}");
                     AdvanceToNextPage(ref curY, ref pageBottom);
                 }
             }
@@ -551,6 +562,7 @@ public sealed class XfaLayoutEngine
             // Handle break after each instance (XFA 3.3 Ch.7b)
             if (subform.HasBreakAfter)
             {
+                if (_verbose) Console.WriteLine($"  [BreakAfter] breakAfter on '{subform.Name}' at curY={curY:F1}");
                 AdvanceToNextPage(ref curY, ref pageBottom, subform.BreakAfterTarget, subform.BreakAfterTargetType);
             }
         }
@@ -572,6 +584,7 @@ public sealed class XfaLayoutEngine
         // Handle page break with optional target page area
         if (subform.HasBreakBefore)
         {
+            if (_verbose) Console.WriteLine($"  [BreakSI] breakBefore on '{subform.Name}' at curY={curY:F1}");
             AdvanceToNextPage(ref curY, ref pageBottom, subform.BreakTarget, subform.BreakTargetType);
         }
 
@@ -645,16 +658,10 @@ public sealed class XfaLayoutEngine
 
         double contentH = innerY - startY;
         double subformH = contentH + marginBottom;
-        // XFA 3.3 Ch.8 Growable Containers: when a data-driven subform has no explicit H/minH
-        // and its children produce zero content height, collapse the bottom margin.
-        // This targets empty choice-set subforms (e.g., element_komplexer_dmstext with empty
-        // data node) where the subform has a subformSet child that found no matching data.
-        // Only collapse when data context is an empty leaf node to avoid cascading to
-        // structural wrappers (Abstandshalter, Rahmen, block) which share parent data.
-        // XFA 3.3 Ch.8: Empty data-driven subforms (e.g., element_komplexer_dmstext with
-        // empty data node) still contribute their margin space. Previously collapsed to 0,
-        // but this caused a ~16pt positioning drift at page boundaries. The reference PDF
-        // renders these empty instances with their bottom margin preserved.
+
+        // XFA 3.3 Ch.8: Enforce minH for subforms.
+        if (subform.MinH.HasValue && subformH < subform.MinH.Value)
+            subformH = subform.MinH.Value;
         // Enforce maxH constraint (XFA 3.3 Ch.8)
         if (subform.MaxH.HasValue)
             subformH = Math.Min(subformH, subform.MaxH.Value);
@@ -678,6 +685,7 @@ public sealed class XfaLayoutEngine
         // Handle break after (XFA 3.3 Ch.7b)
         if (subform.HasBreakAfter)
         {
+            if (_verbose) Console.WriteLine($"  [BreakAfterSI] breakAfter on '{subform.Name}' at curY={curY:F1}");
             AdvanceToNextPage(ref curY, ref pageBottom, subform.BreakAfterTarget, subform.BreakAfterTargetType);
         }
 
@@ -694,6 +702,7 @@ public sealed class XfaLayoutEngine
             // Check if we need a new page
             if (curY >= pageBottom - 1)
             {
+                if (_verbose) Console.WriteLine($"  [Overflow] tb overflow at curY={curY:F1} before child '{child.Name}' (type={child.GetType().Name})");
                 EmitOverflowTrailer(ref curY, pageBottom);
                 AdvanceToNextPage(ref curY, ref pageBottom);
                 EmitOverflowLeader(ref curY, pageBottom);
@@ -717,6 +726,7 @@ public sealed class XfaLayoutEngine
                         if (curY + invH + nextMinH > pageBottom)
                         {
                             // Next element would overflow — move spacer to new page
+                            if (_verbose) Console.WriteLine($"  [InvKeep] invisible '{child.Name}' at curY={curY:F1}, nextMinH={nextMinH:F1}");
                             EmitOverflowTrailer(ref curY, pageBottom);
                             AdvanceToNextPage(ref curY, ref pageBottom);
                             EmitOverflowLeader(ref curY, pageBottom);
@@ -739,6 +749,7 @@ public sealed class XfaLayoutEngine
                     double remaining = pageBottom - curY;
                     if (remaining < nextMinH && remaining < pageBottom * 0.5)
                     {
+                        if (_verbose) Console.WriteLine($"  [KeepNext] '{(child as XfaSubformDef)?.Name}' at curY={curY:F1}, nextMinH={nextMinH:F1}, remaining={remaining:F1}");
                         EmitOverflowTrailer(ref curY, pageBottom);
                         AdvanceToNextPage(ref curY, ref pageBottom);
                         EmitOverflowLeader(ref curY, pageBottom);
@@ -759,9 +770,41 @@ public sealed class XfaLayoutEngine
         {
             if (child.Presence is "hidden" or "inactive")
             {
-                // Still process caption.reserve scripts on hidden fields (e.g., abstand → wert)
-                if (child is XfaFieldDef hiddenField && hiddenField.Scripts is { Count: > 0 })
-                    ProcessCaptionReserveScripts(hiddenField, dataCtx);
+                if (child is XfaFieldDef hiddenField)
+                {
+                    // Let image fields pass through for native handling.
+                    // Use tempY (like normal lr-tb elements at line 806) to prevent
+                    // double-counting: LayoutField advances curY, and lr-tb also
+                    // advances curY via rowH at the end (line 825).
+                    if (hiddenField.IsImageField)
+                    {
+                        // LayoutImageField handles page overflow internally.
+                        // Track page changes to keep curY/rowStartY consistent.
+                        int pageBefore = _currentPage;
+                        double imgTempY = curY;
+                        double imgH = LayoutField(hiddenField, curX, ref imgTempY, availW, pageBottom, dataCtx);
+                        if (imgH > 0)
+                        {
+                            if (_currentPage != pageBefore)
+                            {
+                                // Image caused a page break — sync lr-tb tracking
+                                var newCa = GetContentArea(_currentPage);
+                                pageBottom = newCa.Y + newCa.H;
+                                curY = imgTempY;
+                                rowStartY = imgTempY - imgH;
+                                rowH = imgH;
+                            }
+                            else
+                            {
+                                rowH = Math.Max(rowH, imgH);
+                            }
+                            continue;
+                        }
+                    }
+                    // Still process caption.reserve scripts on hidden fields (e.g., abstand → wert)
+                    if (hiddenField.Scripts is { Count: > 0 })
+                        ProcessCaptionReserveScripts(hiddenField, dataCtx);
+                }
                 continue;
             }
 
@@ -779,6 +822,7 @@ public sealed class XfaLayoutEngine
             // Check page overflow
             if (curY >= pageBottom - 1)
             {
+                if (_verbose) Console.WriteLine($"  [OverflowLR] lr-tb overflow at curY={curY:F1} before child '{child.Name}' (type={child.GetType().Name})");
                 EmitOverflowTrailer(ref curY, pageBottom);
                 AdvanceToNextPage(ref curY, ref pageBottom);
                 EmitOverflowLeader(ref curY, pageBottom);
@@ -1008,6 +1052,13 @@ public sealed class XfaLayoutEngine
 
         if (effectivePresence is "hidden" or "inactive")
         {
+            // Image fields with presence="hidden" rely on JS to set visibility.
+            // Handle natively: check if the field has bound image data and allocate height.
+            if (field.IsImageField)
+            {
+                double imageH = LayoutImageField(field, x, ref curY, availW, pageBottom, dataCtx);
+                if (imageH > 0) return imageH;
+            }
             // Even hidden fields may have scripts that affect siblings (e.g., caption.reserve).
             // Process caption.reserve scripts before returning 0.
             ProcessCaptionReserveScripts(field, dataCtx);
@@ -1048,7 +1099,9 @@ public sealed class XfaLayoutEngine
         // fields with scripts like if (this.rawValue == null) { this.presence = "hidden"; }
         // When the resolved value is empty, treat the field as hidden (0 height).
         if (field.HideIfEmpty && string.IsNullOrEmpty(text))
+        {
             return 0;
+        }
 
         // Caption reserve: use JS override for both layout and rendering.
         // XFA form:ready scripts run AFTER layout per spec, but caption.reserve changes affect
@@ -1205,6 +1258,7 @@ public sealed class XfaLayoutEngine
         if (!invisible && fieldH > remainingOnPage && remainingOnPage < fieldH * 0.3)
         {
             // Not enough room and would waste > 70% of the field — start on next page
+            if (_verbose) Console.WriteLine($"  [FieldOverflow] field '{field.Name}' fieldH={fieldH:F1} remaining={remainingOnPage:F1} at curY={curY:F1}");
             EmitOverflowTrailer(ref curY, pageBottom);
             AdvanceToNextPage(ref curY, ref pageBottom);
             EmitOverflowLeader(ref curY, pageBottom);
@@ -1406,6 +1460,7 @@ public sealed class XfaLayoutEngine
                 lineOffset += sourceLinesUsed;
                 if (lineOffset < fmtLines.Count)
                 {
+                    if (_verbose) Console.WriteLine($"  [TextSplit] field '{field.Name}' splits at curY={curY:F1}, lineOffset={lineOffset}/{fmtLines.Count}, subY={subY:F1}");
                     EmitOverflowTrailer(ref curY, pageBottom);
                     AdvanceToNextPage(ref curY, ref pageBottom);
                     EmitOverflowLeader(ref curY, pageBottom);
@@ -1710,6 +1765,113 @@ public sealed class XfaLayoutEngine
 
         double totalH = fieldH + (field.Para.SpaceBefore ?? 0) + (field.Para.SpaceAfter ?? 0);
         return totalH;
+    }
+
+    /// <summary>
+    /// Handles image fields (imageEdit UI type) that have presence="hidden" in the template.
+    /// These fields rely on JS (soTBXEXTRA_IMAGE.processImageFormReady) to become visible.
+    /// We detect image data natively from the data tree and allocate the correct height.
+    /// </summary>
+    private double LayoutImageField(XfaFieldDef field, double x, ref double curY,
+        double availW, double pageBottom, XfaDataNode? dataCtx)
+    {
+        if (dataCtx is null || field.Name is null) return 0;
+
+        // Image fields are named "imagedata_fit", "imagedata_actual", "imagedata_height",
+        // "imagedata_width", "imagedata_none". The data has an "imageaspect" sibling that
+        // tells us which aspect mode to use (e.g., "width", "fit").
+        // Only the field whose name suffix matches the aspect value should render.
+        string fieldName = field.Name;
+        int underscoreIdx = fieldName.LastIndexOf('_');
+        if (underscoreIdx < 0) return 0;
+        string aspectSuffix = fieldName[(underscoreIdx + 1)..];
+
+        // Find the imageaspect sibling in the data context.
+        // The data context here is the TBXEXTRA_IMAGE node (parent of images_and_margin).
+        // imageaspect is inside hidden_fields subform which is a child of TBXEXTRA_IMAGE.
+        // But since the images_and_margin subform has bind match="none", the dataCtx
+        // flowing into this field is the TBXEXTRA_IMAGE data node.
+        var aspectNode = dataCtx.GetChildren("imageaspect");
+        if (aspectNode.Count == 0 && dataCtx.Parent is not null)
+            aspectNode = dataCtx.Parent.GetChildren("imageaspect");
+        if (aspectNode.Count == 0) return 0;
+
+        string? aspectValue = aspectNode[0].TextValue?.Trim();
+        if (string.IsNullOrEmpty(aspectValue)) return 0;
+
+        // Only render this field if it matches the aspect mode
+        if (!string.Equals(aspectSuffix, aspectValue, StringComparison.OrdinalIgnoreCase))
+            return 0;
+
+        // Find the imagedata node (bound via "$.imagedata")
+        var imageDataNode = ResolveFieldDataNode(field, dataCtx);
+        byte[]? imageBytes = null;
+        if (imageDataNode?.TextValue is not null)
+        {
+            try
+            {
+                string base64 = imageDataNode.TextValue.Trim();
+                if (base64.Length > 0)
+                    imageBytes = Convert.FromBase64String(base64);
+            }
+            catch
+            {
+                // Invalid base64 — skip image rendering but still allocate height
+            }
+        }
+
+        // Find imageheight and imagewidth siblings in data
+        double imageH = field.H ?? 25.4; // default 25.4mm (1 inch)
+        double imageW = field.W ?? availW;
+
+        var heightNodes = dataCtx.GetChildren("imageheight");
+        if (heightNodes.Count == 0 && dataCtx.Parent is not null)
+            heightNodes = dataCtx.Parent.GetChildren("imageheight");
+        if (heightNodes.Count > 0 && heightNodes[0].TextValue is not null)
+        {
+            double? parsedH = XfaTemplateParser.ParseMeasurement(heightNodes[0].TextValue!.Trim());
+            if (parsedH.HasValue && parsedH.Value > 0)
+                imageH = parsedH.Value;
+        }
+
+        var widthNodes = dataCtx.GetChildren("imagewidth");
+        if (widthNodes.Count == 0 && dataCtx.Parent is not null)
+            widthNodes = dataCtx.Parent.GetChildren("imagewidth");
+        if (widthNodes.Count > 0 && widthNodes[0].TextValue is not null)
+        {
+            double? parsedW = XfaTemplateParser.ParseMeasurement(widthNodes[0].TextValue!.Trim());
+            if (parsedW.HasValue && parsedW.Value > 0)
+                imageW = parsedW.Value;
+        }
+
+        // Clamp width to available width
+        if (imageW > availW)
+            imageW = availW;
+
+        double fieldX = x + (field.X ?? 0);
+        double fieldY = curY;
+
+        // Emit the image layout item
+        if (imageBytes is not null && imageBytes.Length > 0)
+        {
+            _items.Add(new LayoutItem(
+                PageIndex: _currentPage,
+                X: fieldX,
+                Y: fieldY,
+                W: imageW,
+                H: imageH,
+                Text: "",
+                Font: new XfaFont(),
+                Para: new XfaPara(),
+                ItemType: LayoutItemType.Image,
+                ImageData: imageBytes));
+        }
+
+        if (_verbose)
+            Console.WriteLine($"  [Image] {field.Name}: {imageW:F1}x{imageH:F1}mm, aspect={aspectValue}, data={imageBytes?.Length ?? 0} bytes, page={_currentPage}, fieldY={fieldY:F1}, newCurY={fieldY + imageH:F1}");
+
+        curY = fieldY + imageH;
+        return imageH;
     }
 
     private double LayoutDraw(XfaDrawDef draw, double x, ref double curY,
@@ -2230,7 +2392,10 @@ public sealed class XfaLayoutEngine
     private void AdvanceToNextPage(ref double curY, ref double pageBottom,
         string? breakTarget = null, string? breakTargetType = null)
     {
-        if (_verbose) Console.WriteLine($"  [Layout] Page break: page {_currentPage}→{_currentPage+1}, curY={curY:F1}, pageBottom={pageBottom:F1}");
+        if (_verbose)
+        {
+            Console.WriteLine($"  [Layout] Page break: page {_currentPage}→{_currentPage+1}, curY={curY:F1}, pageBottom={pageBottom:F1}");
+        }
         _currentPage++;
 
         // Resolve the target page area

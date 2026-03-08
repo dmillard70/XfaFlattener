@@ -46,6 +46,9 @@ public static class XfaPdfWriter
             foreach (var item in pageItems.Where(i => i.ItemType == LayoutItemType.FilledRectangle))
                 DrawItem(gfx, item);
 
+            foreach (var item in pageItems.Where(i => i.ItemType == LayoutItemType.Image))
+                DrawItem(gfx, item);
+
             foreach (var item in pageItems.Where(i => i.ItemType == LayoutItemType.Text))
                 DrawItem(gfx, item);
 
@@ -72,6 +75,10 @@ public static class XfaPdfWriter
 
             case LayoutItemType.FilledRectangle:
                 DrawFilledRectangle(gfx, item);
+                break;
+
+            case LayoutItemType.Image:
+                DrawImage(gfx, item);
                 break;
 
             case LayoutItemType.Text:
@@ -407,6 +414,29 @@ public static class XfaPdfWriter
                     ?? ParseColorBrush(item.Text)
                     ?? new XSolidBrush(XColor.FromArgb(215, 218, 219));
         gfx.DrawRectangle(brush, rect);
+    }
+
+    private static void DrawImage(XGraphics gfx, LayoutItem item)
+    {
+        if (item.ImageData is null || item.ImageData.Length == 0) return;
+
+        double xPt = item.X * MmToPt;
+        double yPt = item.Y * MmToPt;
+        double wPt = item.W * MmToPt;
+        double hPt = item.H * MmToPt;
+
+        if (wPt <= 0 || hPt <= 0) return;
+
+        try
+        {
+            using var ms = new MemoryStream(item.ImageData);
+            using var xImage = XImage.FromStream(ms);
+            gfx.DrawImage(xImage, xPt, yPt, wPt, hPt);
+        }
+        catch
+        {
+            // Image decode failed — skip rendering silently
+        }
     }
 
     /// <summary>
