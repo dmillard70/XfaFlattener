@@ -32,12 +32,11 @@ public static class MetadataCopier
         {
             var srcInfo = sourceDoc.Info;
 
-            // Only proceed if there's any metadata to copy.
+            // Only proceed if there's any metadata to copy (excluding Creator).
             if (string.IsNullOrEmpty(srcInfo.Title) &&
                 string.IsNullOrEmpty(srcInfo.Author) &&
                 string.IsNullOrEmpty(srcInfo.Subject) &&
-                string.IsNullOrEmpty(srcInfo.Keywords) &&
-                string.IsNullOrEmpty(srcInfo.Creator))
+                string.IsNullOrEmpty(srcInfo.Keywords))
             {
                 return;
             }
@@ -58,8 +57,9 @@ public static class MetadataCopier
             if (!string.IsNullOrEmpty(srcInfo.Keywords))
                 destInfo.Keywords = srcInfo.Keywords;
 
-            if (!string.IsNullOrEmpty(srcInfo.Creator))
-                destInfo.Creator = srcInfo.Creator;
+            // Do NOT copy Creator — the original XFA Creator ("Adobe Experience
+            // Manager forms PDF forms") can confuse Acrobat Reader into activating
+            // XFA processing on the flattened PDF.  Keep PDFsharp's default Creator.
 
             destDoc.Save(destinationPdfPath);
         }

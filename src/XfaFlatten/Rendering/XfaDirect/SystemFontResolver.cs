@@ -19,9 +19,9 @@ public sealed class SystemFontResolver : IFontResolver
     // Map font family + style to file name
     private static readonly Dictionary<string, string> FontMap = new(StringComparer.OrdinalIgnoreCase)
     {
-        // SparkasseRg (extracted from reference PDF, subset)
-        { "SparkasseRg|Regular", "SparkasseRg-Regular.otf" },
-        { "SparkasseRg|Bold", "SparkasseRg-Bold.otf" },
+        // SparkasseRg (extracted from reference PDF, converted to TrueType outlines)
+        { "SparkasseRg|Regular", "SparkasseRg-Regular.ttf" },
+        { "SparkasseRg|Bold", "SparkasseRg-Bold.ttf" },
         // Arial
         { "Arial|Regular", "arial.ttf" },
         { "Arial|Bold", "arialbd.ttf" },
@@ -57,8 +57,8 @@ public sealed class SystemFontResolver : IFontResolver
     // Embedded font file names (not in system fonts dir)
     private static readonly HashSet<string> EmbeddedFonts = new(StringComparer.OrdinalIgnoreCase)
     {
-        "SparkasseRg-Regular.otf",
-        "SparkasseRg-Bold.otf",
+        "SparkasseRg-Regular.ttf",
+        "SparkasseRg-Bold.ttf",
     };
 
     /// <summary>
